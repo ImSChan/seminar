@@ -104,18 +104,14 @@ def make_message(text: str, attachments=None, response_type="ephemeral",
         payload["attachments"] = attachments
     return payload
 
+# 변경
 def list_all_cards() -> List[str]:
-    card_dir = os.path.join(BASE_DIR, "public", "card")
-    try:
-        names = [f for f in os.listdir(card_dir) if f.lower().endswith(".jpg")]
-    except FileNotFoundError:
-        logger.error("[ASSET] card dir not found: %s", card_dir)
-        return []
-    except Exception as e:
-        logger.exception("[ASSET] list_all_cards failed: %s", e)
-        return []
-    return sorted(names)
-
+    # 정적 자산은 Vercel 함수 FS에서 안 보일 수 있으므로,
+    # 데이터(키워드 파일) 키를 신뢰 소스로 사용
+    names = [k for k in CARD_KEYWORDS.keys() if k.lower().endswith(".jpg")]
+    names.sort()
+    logger.info("[ASSET] cards via keywords: %d", len(names))
+    return names
 
 def stable_shuffle(all_names: List[str], seed: int) -> List[str]:
     r = random.Random(seed); names = all_names[:]; r.shuffle(names); return names
@@ -221,11 +217,15 @@ def build_pick_ui(request: Request, count: int, picked: List[int], seed: int, to
             "replaceOriginal": replace_original,
             "deleteOriginal": delete_original}
 
+from urllib.parse import quote
 def build_result_ui(req: Request, chosen_cards: List[Dict[str, Any]], reading: Dict[str, Any]) -> Dict[str, Any]:
     atts: List[Dict[str, Any]] = []
     for c in chosen_cards:
         title = f"{c['name'].replace('.jpg','')} {'(역방향)' if c['reversed'] else '(정방향)'}"
-        atts.append({"title": title, "imageUrl": public_url(req, f"/card/{c['name']}")})
+        # 파일명 인코딩
+        img_url = public_url(req, f"/card/{quote(c['name'])}")
+        atts.append({"title": title, "imageUrl": img_url})
+        
     items = reading.get("items") or []
     if items:
         fields = []
