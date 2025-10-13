@@ -191,7 +191,7 @@ def build_confirm_ui(topic: str) -> Dict[str, Any]:
     )
 
 def build_pick_ui(request: Request, count: int, picked: List[int], seed: int, topic: str,
-                  response_type="inChannel", replace_original=False, delete_original=False) -> dict:
+                  response_type="ephemeral", replace_original=False, delete_original=False) -> dict:
     spread_file = SPREAD_FILES.get(count, SPREAD_FILES[3])
     spread_img_url = public_url(request, f"/card_spread/{spread_file}")
     picked_str = ", ".join(map(str, picked)) if picked else "없음"
@@ -242,7 +242,7 @@ def build_result_ui(req: Request, chosen_cards: List[Dict[str, Any]], reading: D
         atts.append({"fields": fields})
     summary = reading.get("summary")
     if summary: atts.append({"text": summary})
-    return make_message(text="타로 결과", attachments=atts, response_type="inChannel", replace_original=True)
+    return make_message(text="타로 결과", attachments=atts, response_type="ephemeral", replace_original=True)
 
 # ---------- Verify ----------
 def verify_request(req: Request):
@@ -271,7 +271,7 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
         seed  = random.randint(1, 2_000_000_000)
         # 채널에 새로 게시 + 확인창 삭제
         return build_pick_ui(req, count=count, picked=[], seed=seed, topic=topic,
-                             response_type="inChannel", replace_original=False, delete_original=True)
+                             response_type="ephemeral", replace_original=False, delete_original=True)
 
     # 2) 카드 선택 단계
     def parse_state(v: str): return v.split("|")
@@ -291,7 +291,7 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
                 # 에셋 문제 안내 (채널에 공지)
                 return make_message(
                     text="⚠️ 카드 이미지가 없습니다. 저장소의 /public/card 에 .jpg 파일을 넣어주세요.",
-                    response_type="inChannel", replace_original=False
+                    response_type="ephemeral", replace_original=False
                 )
 
             deck = stable_shuffle(names, seed)
@@ -308,7 +308,7 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
             if not chosen_cards:
                 return make_message(
                     text="⚠️ 선택한 번호가 덱 범위를 벗어났어요. 다시 시도해 주세요.",
-                    response_type="inChannel", replace_original=False
+                    response_type="ephemeral", replace_original=False
                 )
 
             topic = extract_topic(original.get("text"), "전반운")
@@ -319,13 +319,13 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
         # 아직 선택 미완료 → UI 갱신
         topic = extract_topic(original.get("text"), "전반운")
         return build_pick_ui(req, count=count, picked=picked, seed=seed, topic=topic,
-                            response_type="inChannel", replace_original=True)
+                            response_type="ephemeral", replace_original=True)
 
     if action_value.startswith("reset|"):
         _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
         topic = topic2 or extract_topic(original.get("text"), "전반운")
         return build_pick_ui(req, count=int(count_s), picked=[], seed=int(seed_s), topic=topic,
-                            response_type="inChannel", replace_original=True)
+                            response_type="ephemeral", replace_original=True)
     
     if action_value.startswith("fill|"):
         _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
