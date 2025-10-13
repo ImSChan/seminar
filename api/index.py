@@ -351,6 +351,38 @@ async def dooray_command(req: Request):
     return build_pick_ui(req, count=count, picked=[], seed=seed, topic=topic)
 
 
+from fastapi.responses import JSONResponse
+
+FIXED_RESPONSE = {
+  "text":"주제: 연애운",
+  "attachments":[
+    {"text":"🃏 번호를 순서대로 **6개** 선택해줘요.\n현재 선택: **없음**"},
+    {"title":"6장 스프레드","imageUrl":"https://seminar-orcin.vercel.app/card_spread/card_6.png"},
+    {"callbackId":"tarot-pick","actions":[
+      {"type":"button","text":"1","name":"pick","value":"pick|6|409486075||1","style":"default"},
+      {"type":"button","text":"2","name":"pick","value":"pick|6|409486075||2","style":"default"},
+      {"type":"button","text":"3","name":"pick","value":"pick|6|409486075||3","style":"default"},
+      {"type":"button","text":"4","name":"pick","value":"pick|6|409486075||4","style":"default"},
+      {"type":"button","text":"5","name":"pick","value":"pick|6|409486075||5","style":"default"}
+    ]},
+    {"callbackId":"tarot-pick","actions":[
+      {"type":"button","text":"6","name":"pick","value":"pick|6|409486075||6","style":"default"}
+    ]},
+    {"callbackId":"tarot-pick","actions":[
+      {"type":"button","text":"🔄 다시 선택","name":"reset","value":"reset|6|409486075||연애운","style":"default"},
+      {"type":"button","text":"🎲 무작위로 채우기","name":"fill","value":"fill|6|409486075||연애운","style":"default"}
+    ]}
+  ],
+  "responseType":"inChannel",
+  "replaceOriginal":True
+}
+
+@app.post("/dooray/test")
+def dooray_command():
+    # 그대로 반환
+    return JSONResponse(content=FIXED_RESPONSE)
+
+
 # --- 로컬 개발용 ---
 if __name__ == "__main__":
     import uvicorn
