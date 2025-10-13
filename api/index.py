@@ -49,6 +49,12 @@ def public_url(request: Request, path: str) -> str:
         base = f"{scheme}://{host}"
     return f"{base}{path}"
 
+def extract_topic(t: str | None, default="전반운") -> str:
+    if not t:
+        return default
+    s = t.strip()
+    return s.split(":", 1)[1].strip() if s.startswith("주제:") else s
+
 async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
     ctype = (req.headers.get("content-type") or "").lower()
     # JSON 우선
@@ -258,7 +264,8 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
     if callback_id == "tarot-confirm":
         if action_name == "cancel" or action_value == "cancel":
             return make_message("취소했어요.", response_type="ephemeral", replace_original=True)
-        topic = (original.get("text") or action_value or "전반운").strip()
+        # actionValue(버튼에 실린 실제 주제) 우선, 없으면 originalMessage에서 추출
+        topic = (action_value or extract_topic(original.get("text"), "전반운"))
         spread = decide_spread(topic)
         count = int(spread.get("card_count", 3))
         seed  = random.randint(1, 2_000_000_000)
@@ -304,31 +311,33 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
                     response_type="inChannel", replace_original=False
                 )
 
-            topic = (original.get("text") or "전반운").strip()
+            topic = extract_topic(original.get("text"), "전반운")
             reading = gpt_card_reading(chosen_cards, topic)
+
             return build_result_ui(req, chosen_cards, reading)
 
         # 아직 선택 미완료 → UI 갱신
-        topic = (original.get("text") or "전반운").strip()
+        topic = extract_topic(original.get("text"), "전반운")
         return build_pick_ui(req, count=count, picked=picked, seed=seed, topic=topic,
                             response_type="inChannel", replace_original=True)
 
     if action_value.startswith("reset|"):
-        _, count_s, seed_s, picked_csv, topic = parse_state(action_value)
+        _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
+        topic = topic2 or extract_topic(original.get("text"), "전반운")
         return build_pick_ui(req, count=int(count_s), picked=[], seed=int(seed_s), topic=topic,
-                             response_type="inChannel", replace_original=True)
-
+                            response_type="inChannel", replace_original=True)
+    
     if action_value.startswith("fill|"):
-        _, count_s, seed_s, picked_csv, topic = parse_state(action_value)
+        _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
         count = int(count_s); seed = int(seed_s)
         picked = [int(x) for x in picked_csv.split(",") if x] if picked_csv else []
         remain = [i for i in range(1, count+1) if i not in picked]
         random.shuffle(remain); picked += remain
-        # 완료 루틴 재사용
+        # 완료 루틴 재사용 (topic은 original에서 복구되거나 이후 단계에서 extract_topic 사용)
         return await handle_actions_core(req, {
             "actionName": "pick",
             "actionValue": f"pick|{count}|{seed}|{','.join(map(str,picked[:-1]))}|{picked[-1]}",
-            "originalMessage": original
+            "originalMessage": {"text": f"주제: {topic2 or extract_topic(original.get('text'), '전반운')}"}
         })
 
     return make_message("지원하지 않는 액션입니다.", response_type="ephemeral")
