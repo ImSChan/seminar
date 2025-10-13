@@ -29,10 +29,13 @@ def public_url(request: Request, path: str) -> str:
     return f"{base}{path}"
 
 # -------- Utility: attachments builders --------
-def make_message(text: str, attachments: List[Dict[str, Any]] = None,
-                 response_type: str = "ephemeral",
-                 replace_original: bool = False,
-                 delete_original: bool = False) -> Dict[str, Any]:
+def make_message(
+    text: str,
+    attachments: List[Dict[str, Any]] = None,
+    response_type: str = "ephemeral",
+    replace_original: bool = False,
+    delete_original: bool = False,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "text": text,
         "responseType": response_type,
@@ -43,7 +46,31 @@ def make_message(text: str, attachments: List[Dict[str, Any]] = None,
         payload["attachments"] = attachments
     return payload
 
+def attachment_text_block(text: str) -> Dict[str, Any]:
+    return {"text": text}
 
+def attachment_image_block(
+    title: str, image_url: str, thumb_url: str = None,
+    author_name: str = None, title_link: str = None,
+    callback_id: str = None
+) -> Dict[str, Any]:
+    block: Dict[str, Any] = {"title": title, "imageUrl": image_url}
+    if thumb_url: block["thumbUrl"] = thumb_url
+    if author_name: block["authorName"] = author_name
+    if title_link: block["titleLink"] = title_link
+    if callback_id: block["callbackId"] = callback_id
+    return block
+
+def attachment_fields_block(fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"fields": fields}
+
+def attachment_actions_block(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"actions": actions}
+
+def action_button(text: str, name: str, value: str, style: str = "primary") -> Dict[str, Any]:
+    return {"type": "button", "text": text, "name": name, "value": value, "style": style}
+
+# -------- Dooray payload parser (JSON + FORM) --------
 async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
     """
     Dooray의 Slash/Action 페이로드를 JSON/FORM 모두 지원해서 파싱.
@@ -104,34 +131,13 @@ async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
     is_action = bool(data.get("actionValue"))
     return data, is_action
 
-def attachment_text_block(text: str) -> Dict[str, Any]:
-    return {"text": text}
-
-def attachment_image_block(title: str, image_url: str, thumb_url: str = None,
-                           author_name: str = None, title_link: str = None,
-                           callback_id: str = None) -> Dict[str, Any]:
-    block: Dict[str, Any] = {"title": title, "imageUrl": image_url}
-    if thumb_url: block["thumbUrl"] = thumb_url
-    if author_name: block["authorName"] = author_name
-    if title_link: block["titleLink"] = title_link
-    if callback_id: block["callbackId"] = callback_id
-    return block
-
-def attachment_fields_block(fields: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {"fields": fields}
-
-def attachment_actions_block(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
-    return {"actions": actions}
-
-def action_button(text: str, name: str, value: str, style: str = "primary") -> Dict[str, Any]:
-    return {"type": "button", "text": text, "name": name, "value": value, "style": style}
-
 # -------- GPT Helpers --------
 SPREAD_FILES = {
-    1: "card_1.png",
-    3: "card_3.png",
-    5: "card_5.png",
-    6: "card_6.png",
+    1:  "card_1.png",
+    2:  "card_2.png",  # 추가
+    3:  "card_3.png",
+    5:  "card_5.png",
+    6:  "card_6.png",
     10: "card_10.png",
 }
 
@@ -148,17 +154,16 @@ def decide_spread(topic: str) -> Dict[str, Any]:
 JSON 형식만 반환(코드블록 금지):
 {"spread":"3장","reason":"...","card_count":3}
 """
-    res = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role":"system","content":system_prompt.strip()},
-            {"role":"user","content":topic}
-        ],
-        temperature=0.7,
-    )
-    text = res.choices[0].message.content.strip()
-    # 안전하게 eval 대신 json.loads 시도
     try:
+        res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role":"system","content":system_prompt.strip()},
+                {"role":"user","content":topic}
+            ],
+            temperature=0.7,
+        )
+        text = res.choices[0].message.content.strip()
         return json.loads(text)
     except Exception:
         # 실패 시 기본값(3장)
@@ -197,45 +202,48 @@ def gpt_card_reading(cards: List[Dict[str, Any]], topic: str) -> Dict[str, Any]:
   "summary": "🧙 전체 해석: ..."
 }}
 """
-    res = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role":"user","content":prompt.strip()}],
-        temperature=0.8,
-    )
-    txt = res.choices[0].message.content.strip()
     try:
+        res = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role":"user","content":prompt.strip()}],
+            temperature=0.8,
+        )
+        txt = res.choices[0].message.content.strip()
         return json.loads(txt)
     except Exception:
         # 파싱 실패 시 통째로 텍스트를 summary로
-        return {"items": [], "summary": txt}
-def build_pick_ui(request: Request, count: int, picked: list[int], seed: int, topic: str) -> dict:
+        return {"items": [], "summary": "🧙 전체 해석: 카드의 조합을 긍정적으로 바라보되, 핵심에 집중하세요."}
+
+# -------- UI Builder --------
+def build_pick_ui(
+    request: Request, count: int, picked: List[int], seed: int, topic: str,
+    response_type: str = "ephemeral", replace_original: bool = False
+) -> dict:
     spread_file = SPREAD_FILES.get(count, SPREAD_FILES[3])
     spread_img_url = public_url(request, f"/card_spread/{spread_file}")
 
     picked_str = ", ".join(map(str, picked)) if picked else "없음"
     remain = [i for i in range(1, count + 1) if i not in picked]
 
-    atts = []
-    atts.append({"text": f"🃏 번호를 순서대로 **{count}개** 선택해줘요.\n현재 선택: **{picked_str}**"})
-    atts.append({"title": f"{count}장 스프레드", "imageUrl": spread_img_url})
+    atts: List[Dict[str, Any]] = []
+    atts.append({"callbackId": "tarot-pick",
+                 "text": f"🃏 번호를 순서대로 **{count}개** 선택해줘요.\n현재 선택: **{picked_str}**",
+                 "title": f"{count}장 스프레드",
+                 "imageUrl": spread_img_url})
 
-    # ⬇⬇⬇ 중요: callbackId를 같은 attachment 블록에 넣어둔다
-    # 버튼 value는 상태를 인코딩해서 전달
-    row = []
+    # 번호 버튼 (5개씩 끊어서 rows 구성)
+    row: List[Dict[str, Any]] = []
     for i, num in enumerate(remain, start=1):
-        row.append({
-            "type": "button",
-            "text": str(num),
-            "name": "pick",
-            "value": f"pick|{count}|{seed}|{','.join(map(str,picked))}|{num}",
-            "style": "default"
-        })
+        row.append({"type": "button", "text": str(num), "name": "pick",
+                    "value": f"pick|{count}|{seed}|{','.join(map(str,picked))}|{num}",
+                    "style": "default"})
         if i % 5 == 0:
             atts.append({"callbackId": "tarot-pick", "actions": row})
             row = []
     if row:
         atts.append({"callbackId": "tarot-pick", "actions": row})
 
+    # 리셋/랜덤 채우기
     atts.append({
         "callbackId": "tarot-pick",
         "actions": [
@@ -249,43 +257,24 @@ def build_pick_ui(request: Request, count: int, picked: list[int], seed: int, to
     return {
         "text": f"주제: {topic}",
         "attachments": atts,
-        "responseType": "inChannel",
-        "replaceOriginal": True
+        "responseType": response_type,          # A안 기본: "ephemeral"
+        "replaceOriginal": replace_original      # 초기엔 False, 액션 갱신 시 True
     }
 
-
 # -------- Core flow --------
-def pick_random_cards(all_card_names: List[str], count: int) -> List[Dict[str, Any]]:
-    random.shuffle(all_card_names)
-    chosen = all_card_names[:count]
-    return [{"name": n, "reversed": random.choice([True, False])} for n in chosen]
-
 def list_all_cards() -> List[str]:
     # public/card 아래 파일명을 URL 없이 리스트업
     card_dir = os.path.join(BASE_DIR, "public", "card")
     names = [f for f in os.listdir(card_dir) if f.lower().endswith(".jpg")]
     return sorted(names)
 
-# -------- Dooray Slash Command --------
-class SlashPayload(BaseModel):
-    # Dooray가 보내는 실제 필드명은 조직 설정에 따라 다를 수 있음.
-    # 최소한 text, userId, channelId 같은 것만 참고.
-    text: str | None = None
-
-def verify_request(req: Request):
-    # 필요시 헤더/토큰 검증
-    expected = os.getenv("DOORAY_VERIFY_TOKEN")
-    if not expected:
-        return
-    got = req.headers.get("X-Dooray-Token") or req.headers.get("Authorization")
-    if got != expected:
-        raise HTTPException(status_code=401, detail="invalid token")
-
-def stable_shuffle(all_names: list[str], seed: int) -> list[str]:
+def stable_shuffle(all_names: List[str], seed: int) -> List[str]:
     r = random.Random(seed)
     names = all_names[:]
     r.shuffle(names)
     return names
+
+# -------- Actions handler --------
 async def handle_actions(req: Request, data: dict):
     action_value = data.get("actionValue")
     original     = data.get("originalMessage", {}) or {}
@@ -300,22 +289,66 @@ async def handle_actions(req: Request, data: dict):
         choose = int(choose_s)
         if choose not in picked: picked.append(choose)
 
+        # 완료 시 결과 산출
         if len(picked) >= count:
             names = list_all_cards()
             deck  = stable_shuffle(names, seed)
-            chosen_cards = []
+            chosen_cards: List[Dict[str, Any]] = []
             for pos in picked:
                 idx = pos - 1
                 if 0 <= idx < len(deck):
-                    chosen_cards.append({"name": deck[idx], "reversed": random.choice([True, False])})
+                    chosen_cards.append({
+                        "name": deck[idx],
+                        "reversed": random.choice([True, False])
+                    })
+
             reading = gpt_card_reading(chosen_cards, topic)
-            # 결과 메시지 구성 (생략: 네 기존 코드와 동일)
-            ...
-        return build_pick_ui(req, count=count, picked=picked, seed=seed, topic=topic)
+
+            atts: List[Dict[str, Any]] = []
+            # 카드 이미지
+            for c in chosen_cards:
+                title = f"{c['name'].replace('.jpg','')} {'(역방향)' if c['reversed'] else '(정방향)'}"
+                atts.append({
+                    "title": title,
+                    "imageUrl": public_url(req, f"/card/{c['name']}")
+                })
+
+            # 카드 해석 fields
+            items = reading.get("items") or []
+            if items:
+                fields: List[Dict[str, Any]] = []
+                for item in items:
+                    fields.append({
+                        "title": f"🔮 {item.get('name','')}",
+                        "value": f"{item.get('position','')} | {item.get('keyword','')}\n👉 {item.get('meaning','')}\n💡 {item.get('advice','')}",
+                        "short": False
+                    })
+                atts.append({"fields": fields})
+
+            # 전체 요약
+            summary = reading.get("summary")
+            if summary:
+                atts.append({"text": summary})
+
+            return make_message(
+                text="타로 결과",
+                attachments=atts,
+                response_type="ephemeral",      # 최초와 동일 스코프로 유지
+                replace_original=True           # 기존 메시지 교체
+            )
+
+        # 아직 덜 골랐으면 선택 UI 갱신 (ephemeral 그대로)
+        return build_pick_ui(
+            req, count=count, picked=picked, seed=seed, topic=topic,
+            response_type="ephemeral", replace_original=True
+        )
 
     if action_value.startswith("reset|"):
         _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
-        return build_pick_ui(req, count=int(count_s), picked=[], seed=int(seed_s), topic=topic2 or topic)
+        return build_pick_ui(
+            req, count=int(count_s), picked=[], seed=int(seed_s), topic=(topic2 or topic),
+            response_type="ephemeral", replace_original=True
+        )
 
     if action_value.startswith("fill|"):
         _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
@@ -332,7 +365,18 @@ async def handle_actions(req: Request, data: dict):
 
     return {"text":"지원하지 않는 액션입니다.", "responseType":"ephemeral"}
 
+# -------- Entry (single endpoint) --------
+class SlashPayload(BaseModel):
+    text: str | None = None
 
+def verify_request(req: Request):
+    # 필요시 헤더/토큰 검증
+    expected = os.getenv("DOORAY_VERIFY_TOKEN")
+    if not expected:
+        return
+    got = req.headers.get("X-Dooray-Token") or req.headers.get("Authorization")
+    if got != expected:
+        raise HTTPException(status_code=401, detail="invalid token")
 
 @app.post("/dooray/command")
 async def dooray_command(req: Request):
@@ -342,67 +386,17 @@ async def dooray_command(req: Request):
     if is_action:  # 버튼 콜백
         return await handle_actions(req, data)
 
-    # 슬래시 커맨드
+    # 슬래시 커맨드 → 스프레드 결정
     topic = (data.get("text") or "").strip() or "전반운"
     spread_info = decide_spread(topic)
     count = int(spread_info.get("card_count", 3))
     seed = random.randint(1, 2_000_000_000)
 
-    return build_pick_ui(req, count=count, picked=[], seed=seed, topic=topic)
-
-
-from fastapi.responses import JSONResponse
-
-
-# 필요에 따라 여기만 바꾸면 됩니다.
-PROJECT_HOST = "https://seminar-orcin.vercel.app"  # 배포 주소
-SPREAD_COUNT = 6                                    # 1,3,5,6,10 중 택1
-SEED = 409486075                                     # 버튼 상태용 예시 시드
-TOPIC = "연애운"
-
-@app.post("/dooray/test")
-def dooray_commands():
-    # 스프레드 이미지 URL
-    image_url = f"{PROJECT_HOST}/card_spread/card_{SPREAD_COUNT}.png"
-
-    payload = {
-        "responseType": "ephemeral",      # 먼저 사용자인 나만 보이게
-        "replaceOriginal": False,         # 새 메시지로 전송
-        "text": f"주제: {TOPIC}",
-        "attachments": [
-            {
-                "callbackId": "tarot-pick",
-                "text": f"🃏 번호를 순서대로 **{SPREAD_COUNT}개** 선택해줘요.\n현재 선택: **없음**",
-                "title": f"{SPREAD_COUNT}장 스프레드",
-                "imageUrl": image_url,
-                "actions": [
-                    {"name": "pick", "type": "button", "text": "1", "value": f"pick|{SPREAD_COUNT}|{SEED}||1", "style": "default"},
-                    {"name": "pick", "type": "button", "text": "2", "value": f"pick|{SPREAD_COUNT}|{SEED}||2", "style": "default"},
-                    {"name": "pick", "type": "button", "text": "3", "value": f"pick|{SPREAD_COUNT}|{SEED}||3", "style": "default"}
-                ]
-            },
-            {
-                "callbackId": "tarot-pick",
-                "actions": [
-                    {"name": "pick", "type": "button", "text": "4", "value": f"pick|{SPREAD_COUNT}|{SEED}||4", "style": "default"},
-                    {"name": "pick", "type": "button", "text": "5", "value": f"pick|{SPREAD_COUNT}|{SEED}||5", "style": "default"},
-                    {"name": "pick", "type": "button", "text": "6", "value": f"pick|{SPREAD_COUNT}|{SEED}||6", "style": "default"}
-                ]
-            },
-            {
-                "callbackId": "tarot-pick",
-                "actions": [
-                    {"name": "reset", "type": "button", "text": "🔄 다시 선택", "value": f"reset|{SPREAD_COUNT}|{SEED}||{TOPIC}", "style": "default"},
-                    {"name": "fill",  "type": "button", "text": "🎲 무작위로 채우기", "value": f"fill|{SPREAD_COUNT}|{SEED}||{TOPIC}",  "style": "default"}
-                ]
-            }
-        ]
-    }
-
-    return JSONResponse(content=payload, media_type="application/json; charset=utf-8")
-
-
-
+    # A안: 최초는 ephemeral + replaceOriginal:false
+    return build_pick_ui(
+        req, count=count, picked=[], seed=seed, topic=topic,
+        response_type="ephemeral", replace_original=False
+    )
 
 # --- 로컬 개발용 ---
 if __name__ == "__main__":
