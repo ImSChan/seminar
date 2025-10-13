@@ -106,8 +106,16 @@ def make_message(text: str, attachments=None, response_type="ephemeral",
 
 def list_all_cards() -> List[str]:
     card_dir = os.path.join(BASE_DIR, "public", "card")
-    names = [f for f in os.listdir(card_dir) if f.lower().endswith(".jpg")]
+    try:
+        names = [f for f in os.listdir(card_dir) if f.lower().endswith(".jpg")]
+    except FileNotFoundError:
+        logger.error("[ASSET] card dir not found: %s", card_dir)
+        return []
+    except Exception as e:
+        logger.exception("[ASSET] list_all_cards failed: %s", e)
+        return []
     return sorted(names)
+
 
 def stable_shuffle(all_names: List[str], seed: int) -> List[str]:
     r = random.Random(seed); names = all_names[:]; r.shuffle(names); return names
@@ -268,20 +276,42 @@ async def handle_actions_core(req: Request, data: dict) -> Dict[str, Any]:
         choose = int(choose_s)
         if choose not in picked: picked.append(choose)
 
+        # 선택 완료
         if len(picked) >= count:
-            names = list_all_cards(); deck = stable_shuffle(names, seed)
+            names = list_all_cards()
+            logger.info("[ASSET] cards=%d", len(names))
+            if not names:
+                # 에셋 문제 안내 (채널에 공지)
+                return make_message(
+                    text="⚠️ 카드 이미지가 없습니다. 저장소의 /public/card 에 .jpg 파일을 넣어주세요.",
+                    response_type="inChannel", replace_original=False
+                )
+
+            deck = stable_shuffle(names, seed)
+            logger.info("[DECK] seed=%s first5=%s", seed, deck[:5])
+
             chosen_cards = []
             for pos in picked:
                 idx = pos - 1
                 if 0 <= idx < len(deck):
                     chosen_cards.append({"name": deck[idx], "reversed": random.choice([True, False])})
+                else:
+                    logger.error("[INDEX] pos=%s out of range deck_len=%s", pos, len(deck))
+
+            if not chosen_cards:
+                return make_message(
+                    text="⚠️ 선택한 번호가 덱 범위를 벗어났어요. 다시 시도해 주세요.",
+                    response_type="inChannel", replace_original=False
+                )
+
             topic = (original.get("text") or "전반운").strip()
             reading = gpt_card_reading(chosen_cards, topic)
             return build_result_ui(req, chosen_cards, reading)
 
+        # 아직 선택 미완료 → UI 갱신
         topic = (original.get("text") or "전반운").strip()
         return build_pick_ui(req, count=count, picked=picked, seed=seed, topic=topic,
-                             response_type="inChannel", replace_original=True)
+                            response_type="inChannel", replace_original=True)
 
     if action_value.startswith("reset|"):
         _, count_s, seed_s, picked_csv, topic = parse_state(action_value)
@@ -323,8 +353,17 @@ async def dooray_actions(req: Request):
     verify_request(req)
     raw = (await req.body()).decode("utf-8","ignore")
     logger.info("[IN] POST /dooray/actions CT=%s RAW=%s", req.headers.get("content-type"), raw[:2000])
-    data, _ = await parse_dooray_payload(req)
-    return respond(await handle_actions_core(req, data), tag="action@actions")
+    try:
+        data, _ = await parse_dooray_payload(req)
+        payload = await handle_actions_core(req, data)
+        return respond(payload, tag="action@actions")
+    except Exception as e:
+        logger.exception("[UNHANDLED] actions crashed: %s", e)
+        # Dooray는 500을 싫어함. 200으로 에러 메시지 반환
+        return respond(make_message(
+            text="⚠️ 내부 오류가 발생했어요. 로그를 확인 중입니다.",
+            response_type="ephemeral"
+        ), tag="action@actions-error")
 
 # ----- Local run -----
 if __name__ == "__main__":
