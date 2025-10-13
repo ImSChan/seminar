@@ -219,33 +219,6 @@ def verify_request(req: Request):
     got = req.headers.get("X-Dooray-Token") or req.headers.get("Authorization")
     if got != expected:
         raise HTTPException(status_code=401, detail="invalid token")
-@app.post("/dooray/command")
-async def dooray_command(req: Request):
-    verify_request(req)
-    body = await req.json()
-    topic = (body.get("text") or "").strip() or "전반운"
-
-    # 1) 스프레드 결정
-    spread_info = decide_spread(topic)
-    count = int(spread_info.get("card_count", 3))
-    reason = spread_info.get("reason", "해석을 위해")
-
-    # 2) 덱 셔플을 위한 seed 생성(상태 없이 재현 가능)
-    seed = random.randint(1, 2_000_000_000)
-
-    # 3) 첫 화면: 이유 + 선택 UI
-    intro = make_message(
-        text=f"주제: {topic}",
-        attachments=[
-            attachment_text_block(f"🧐 {reason} → **{count}장**으로 볼게요!")
-        ],
-        response_type="inChannel",
-        replace_original=False
-    )
-
-    # Dooray는 하나의 응답만 받는다면, 첫 화면 대신 곧바로 선택 UI만 보내도 OK.
-    # 여기서는 선택 UI만 보내도록 바로 리턴:
-    return build_pick_ui(req, count=count, picked=[], seed=seed, topic=topic)
 
 def stable_shuffle(all_names: list[str], seed: int) -> list[str]:
     r = random.Random(seed)
@@ -253,40 +226,23 @@ def stable_shuffle(all_names: list[str], seed: int) -> list[str]:
     r.shuffle(names)
     return names
 
-# -------- Dooray Interactive Actions --------
+async def handle_actions(req: Request, data: dict):
+    # Dooray 액션 페이로드 공통 처리
+    action_value = data.get("actionValue")
+    original     = data.get("originalMessage", {})
+    topic        = (original.get("text") or "전반운").strip()
 
-@app.post("/dooray/actions")
-async def dooray_actions(req: Request):
-    verify_request(req)
-    data = await req.json()
-
-    # ✅ Dooray는 여기를 최상위로 보냄
-    action_name  = data.get("actionName")    # 예: "send" / "pick" / "reset" ...
-    action_value = data.get("actionValue")   # 예: "pick|3|123456|1,2|3"
-    callback_id  = data.get("callbackId")    # 예: "tarot-pick"
-    original     = data.get("originalMessage", {})  # 원본 메시지
-
-    if not action_value:
-        raise HTTPException(status_code=400, detail="missing actionValue")
-
-    def parse_state(v: str):
-        # "pick|<count>|<seed>|<picked_csv>|<choose>"
-        # "reset|<count>|<seed>|<picked_csv>|<topic>"
-        # "fill|<count>|<seed>|<picked_csv>|<topic>"
-        return v.split("|")
+    def parse_state(v: str): return v.split("|")
 
     if action_value.startswith("pick|"):
         _, count_s, seed_s, picked_csv, choose_s = parse_state(action_value)
-        count = int(count_s)
-        seed = int(seed_s)
+        count = int(count_s); seed = int(seed_s)
         picked = [int(x) for x in picked_csv.split(",") if x] if picked_csv else []
         choose = int(choose_s)
-
-        if choose not in picked:
-            picked.append(choose)
+        if choose not in picked: picked.append(choose)
 
         if len(picked) >= count:
-            # 결과 산출 (seed로 안정 셔플)
+            # 결과 산출
             names = list_all_cards()
             deck  = stable_shuffle(names, seed)
             chosen_cards = []
@@ -295,7 +251,6 @@ async def dooray_actions(req: Request):
                 if 0 <= idx < len(deck):
                     chosen_cards.append({"name": deck[idx], "reversed": random.choice([True, False])})
 
-            topic = (original.get("text") or "전반운").strip()
             reading = gpt_card_reading(chosen_cards, topic)
 
             atts = []
@@ -312,7 +267,6 @@ async def dooray_actions(req: Request):
                         "short": False
                     })
                 atts.append({"fields": fields})
-
             if reading.get("summary"):
                 atts.append({"text": reading["summary"]})
 
@@ -323,29 +277,49 @@ async def dooray_actions(req: Request):
                 "replaceOriginal": True
             }
 
-        # 아직 덜 골랐으면 UI 갱신
-        topic = (original.get("text") or "전반운").strip()
+        # 아직 덜 골랐으면 선택 UI 갱신
         return build_pick_ui(req, count=count, picked=picked, seed=seed, topic=topic)
 
     if action_value.startswith("reset|"):
-        _, count_s, seed_s, picked_csv, topic = parse_state(action_value)
-        return build_pick_ui(req, count=int(count_s), picked=[], seed=int(seed_s), topic=topic)
+        _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
+        return build_pick_ui(req, count=int(count_s), picked=[], seed=int(seed_s), topic=topic2 or topic)
 
     if action_value.startswith("fill|"):
-        _, count_s, seed_s, picked_csv, topic = parse_state(action_value)
+        _, count_s, seed_s, picked_csv, topic2 = parse_state(action_value)
         count = int(count_s); seed = int(seed_s)
         picked = [int(x) for x in picked_csv.split(",") if x] if picked_csv else []
         remain = [i for i in range(1, count+1) if i not in picked]
         random.shuffle(remain)
         picked += remain
-        # 완료 루틴 재사용: 마지막 선택만 pick으로 만들어 재귀 호출
-        fake_value = f"pick|{count}|{seed}|{','.join(map(str,picked[:-1]))}|{picked[-1]}"
-        data["actionValue"] = fake_value
-        req._body = json.dumps(data).encode("utf-8")  # 같은 요청 객체로 재호출
-        return await dooray_actions(req)
+        # 완료 루틴 재사용
+        fake = {"actionValue": f"pick|{count}|{seed}|{','.join(map(str,picked[:-1]))}|{picked[-1]}",
+                "originalMessage": {"text": topic2 or topic}}
+        return await handle_actions(req, fake)
 
-    return {"text":"지원하지 않는 액션입니다.", "responseType":"ephemeral"}
+    return {"text": "지원하지 않는 액션입니다.", "responseType": "ephemeral"}
 
+
+    
+@app.post("/dooray/command")
+async def dooray_command(req: Request):
+    verify_request(req)
+    body = await req.json()
+
+    # --- 1) 액션(버튼)인지 먼저 판별 ---
+    action_value = body.get("actionValue")
+    if action_value:                      # 버튼 클릭 콜백
+        return await handle_actions(req, body)
+
+    # --- 2) 슬래시 커맨드 처리 ---
+    topic = (body.get("text") or "").strip() or "전반운"
+
+    spread_info = decide_spread(topic)
+    count = int(spread_info.get("card_count", 3))
+    reason = spread_info.get("reason", "해석을 위해")
+    seed = random.randint(1, 2_000_000_000)
+
+    # 곧바로 번호 선택 UI 반환
+    return build_pick_ui(req, count=count, picked=[], seed=seed, topic=topic)
 
 # --- 로컬 개발용 ---
 if __name__ == "__main__":
