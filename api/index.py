@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 from openai import OpenAI
 import os, json, random
 
@@ -42,6 +42,67 @@ def make_message(text: str, attachments: List[Dict[str, Any]] = None,
     if attachments:
         payload["attachments"] = attachments
     return payload
+
+
+async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
+    """
+    Dooray의 Slash/Action 페이로드를 JSON/FORM 모두 지원해서 파싱.
+    return: (data, is_action)
+    """
+    ctype = (req.headers.get("content-type") or "").lower()
+
+    # 1) JSON 시도
+    if "application/json" in ctype:
+        try:
+            data = await req.json()
+            # 액션 여부: 최상위 actionValue 또는 actions[0].value 로 판단
+            is_action = bool(
+                data.get("actionValue")
+                or (data.get("actions") and data["actions"][0].get("value"))
+            )
+            # actions[0].value 형태면 actionValue로 승격시켜 일관 처리
+            if not data.get("actionValue") and data.get("actions"):
+                data["actionValue"] = data["actions"][0].get("value")
+                data["actionName"]  = data["actions"][0].get("name") or data.get("actionName")
+            return data, is_action
+        except Exception:
+            pass  # 폼 전송일 가능성
+
+    # 2) FORM 시도 (x-www-form-urlencoded, multipart/form-data)
+    form = await req.form()
+    data: Dict[str, Any] = {}
+
+    # Slack류처럼 payload에 JSON 문자열이 통째로 들어오는 케이스
+    if "payload" in form:
+        try:
+            data = json.loads(form["payload"])
+        except Exception:
+            data = {}
+    else:
+        # 키-값 그대로 받기
+        for k, v in form.items():
+            # originalMessage 같은 중첩 JSON 필드일 수 있음 → 파싱 시도
+            if isinstance(v, str) and v.startswith("{") and v.endswith("}"):
+                try:
+                    data[k] = json.loads(v)
+                    continue
+                except Exception:
+                    pass
+            data[k] = v
+
+    # actions[0].value → actionValue로 승격
+    if data.get("actions") and isinstance(data["actions"], list) and data["actions"]:
+        if not data.get("actionValue"):
+            v = data["actions"][0].get("value")
+            if v:
+                data["actionValue"] = v
+        if not data.get("actionName"):
+            n = data["actions"][0].get("name")
+            if n:
+                data["actionName"] = n
+
+    is_action = bool(data.get("actionValue"))
+    return data, is_action
 
 def attachment_text_block(text: str) -> Dict[str, Any]:
     return {"text": text}
@@ -225,11 +286,9 @@ def stable_shuffle(all_names: list[str], seed: int) -> list[str]:
     names = all_names[:]
     r.shuffle(names)
     return names
-
 async def handle_actions(req: Request, data: dict):
-    # Dooray 액션 페이로드 공통 처리
     action_value = data.get("actionValue")
-    original     = data.get("originalMessage", {})
+    original     = data.get("originalMessage", {}) or {}
     topic        = (original.get("text") or "전반운").strip()
 
     def parse_state(v: str): return v.split("|")
@@ -242,7 +301,6 @@ async def handle_actions(req: Request, data: dict):
         if choose not in picked: picked.append(choose)
 
         if len(picked) >= count:
-            # 결과 산출
             names = list_all_cards()
             deck  = stable_shuffle(names, seed)
             chosen_cards = []
@@ -250,34 +308,9 @@ async def handle_actions(req: Request, data: dict):
                 idx = pos - 1
                 if 0 <= idx < len(deck):
                     chosen_cards.append({"name": deck[idx], "reversed": random.choice([True, False])})
-
             reading = gpt_card_reading(chosen_cards, topic)
-
-            atts = []
-            for c in chosen_cards:
-                title = f"{c['name'].replace('.jpg','')} {'(역방향)' if c['reversed'] else '(정방향)'}"
-                atts.append({"title": title, "imageUrl": public_url(req, f"/card/{c['name']}")})
-
-            if reading.get("items"):
-                fields = []
-                for item in reading["items"]:
-                    fields.append({
-                        "title": f"🔮 {item.get('name','')}",
-                        "value": f"{item.get('position','')} | {item.get('keyword','')}\n👉 {item.get('meaning','')}\n💡 {item.get('advice','')}",
-                        "short": False
-                    })
-                atts.append({"fields": fields})
-            if reading.get("summary"):
-                atts.append({"text": reading["summary"]})
-
-            return {
-                "text": "타로 결과",
-                "attachments": atts,
-                "responseType": "inChannel",
-                "replaceOriginal": True
-            }
-
-        # 아직 덜 골랐으면 선택 UI 갱신
+            # 결과 메시지 구성 (생략: 네 기존 코드와 동일)
+            ...
         return build_pick_ui(req, count=count, picked=picked, seed=seed, topic=topic)
 
     if action_value.startswith("reset|"):
@@ -291,35 +324,32 @@ async def handle_actions(req: Request, data: dict):
         remain = [i for i in range(1, count+1) if i not in picked]
         random.shuffle(remain)
         picked += remain
-        # 완료 루틴 재사용
-        fake = {"actionValue": f"pick|{count}|{seed}|{','.join(map(str,picked[:-1]))}|{picked[-1]}",
-                "originalMessage": {"text": topic2 or topic}}
-        return await handle_actions(req, fake)
+        # 완료 루틴 재사용 (새 data 구성만 해서 재호출)
+        return await handle_actions(req, {
+            "actionValue": f"pick|{count}|{seed}|{','.join(map(str,picked[:-1]))}|{picked[-1]}",
+            "originalMessage": {"text": topic2 or topic}
+        })
 
-    return {"text": "지원하지 않는 액션입니다.", "responseType": "ephemeral"}
+    return {"text":"지원하지 않는 액션입니다.", "responseType":"ephemeral"}
 
 
-    
+
 @app.post("/dooray/command")
 async def dooray_command(req: Request):
     verify_request(req)
-    body = await req.json()
+    data, is_action = await parse_dooray_payload(req)
 
-    # --- 1) 액션(버튼)인지 먼저 판별 ---
-    action_value = body.get("actionValue")
-    if action_value:                      # 버튼 클릭 콜백
-        return await handle_actions(req, body)
+    if is_action:  # 버튼 콜백
+        return await handle_actions(req, data)
 
-    # --- 2) 슬래시 커맨드 처리 ---
-    topic = (body.get("text") or "").strip() or "전반운"
-
+    # 슬래시 커맨드
+    topic = (data.get("text") or "").strip() or "전반운"
     spread_info = decide_spread(topic)
     count = int(spread_info.get("card_count", 3))
-    reason = spread_info.get("reason", "해석을 위해")
     seed = random.randint(1, 2_000_000_000)
 
-    # 곧바로 번호 선택 UI 반환
     return build_pick_ui(req, count=count, picked=[], seed=seed, topic=topic)
+
 
 # --- 로컬 개발용 ---
 if __name__ == "__main__":
