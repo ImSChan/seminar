@@ -1,42 +1,278 @@
-# FastAPI 서버리스 함수 (Vercel Python Runtime가 app 변수를 자동 인식)
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Any, Dict, List
+from openai import OpenAI
+import os, json, random
 
-app = FastAPI(title="Tarot Backend", version="0.1.0")
+app = FastAPI(title="Dooray Tarot Bot")
 
-# CORS (필요시 도메인 제한 걸면 됨)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: 배포 후 프론트 도메인으로 제한 권장
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# -------- OpenAI Client --------
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-class EchoIn(BaseModel):
-    message: str
+# -------- Load Card Keywords --------
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # 프로젝트 루트
+KEYWORD_PATH = os.path.join(BASE_DIR, "data", "card_keywords.json")
+with open(KEYWORD_PATH, "r", encoding="utf-8") as f:
+    CARD_KEYWORDS: Dict[str, str] = json.load(f)
 
-@app.get("/")
-def root():
-    return {"ok": True, "name": "tarot-backend", "docs": "/docs", "health": "/health"}
+# -------- Static URL Builder --------
+def public_url(request: Request, path: str) -> str:
+    """
+    /public 하위 파일을 정적 URL로.
+    path는 '/card/xxx.jpg' 처럼 전달.
+    """
+    base = os.getenv("APP_BASE_URL")
+    if not base:
+        scheme = request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        base = f"{scheme}://{host}"
+    return f"{base}{path}"
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+# -------- Utility: attachments builders --------
+def make_message(text: str, attachments: List[Dict[str, Any]] = None,
+                 response_type: str = "ephemeral",
+                 replace_original: bool = False,
+                 delete_original: bool = False) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "text": text,
+        "responseType": response_type,
+        "replaceOriginal": replace_original,
+        "deleteOriginal": delete_original,
+    }
+    if attachments:
+        payload["attachments"] = attachments
+    return payload
 
-@app.get("/sum")
-def sum_numbers(a: float | None = None, b: float | None = None):
-    if a is None or b is None:
-        raise HTTPException(status_code=400, detail="query string으로 a, b 값을 넘겨줘")
-    return {"a": a, "b": b, "sum": a + b}
+def attachment_text_block(text: str) -> Dict[str, Any]:
+    return {"text": text}
 
-@app.post("/echo")
-def echo(body: EchoIn):
-    return {"echo": body.message}
+def attachment_image_block(title: str, image_url: str, thumb_url: str = None,
+                           author_name: str = None, title_link: str = None,
+                           callback_id: str = None) -> Dict[str, Any]:
+    block: Dict[str, Any] = {"title": title, "imageUrl": image_url}
+    if thumb_url: block["thumbUrl"] = thumb_url
+    if author_name: block["authorName"] = author_name
+    if title_link: block["titleLink"] = title_link
+    if callback_id: block["callbackId"] = callback_id
+    return block
 
-# ---- 로컬 개발용 엔트리포인트 (uvicorn) ----
-# 로컬에서 `python api/index.py`로도 띄울 수 있게 옵션 제공
+def attachment_fields_block(fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"fields": fields}
+
+def attachment_actions_block(actions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {"actions": actions}
+
+def action_button(text: str, name: str, value: str, style: str = "primary") -> Dict[str, Any]:
+    return {"type": "button", "text": text, "name": name, "value": value, "style": style}
+
+# -------- GPT Helpers --------
+SPREAD_FILES = {
+    1: "card_1.png",
+    3: "card_3.png",
+    5: "card_5.png",
+    6: "card_6.png",
+    10: "card_10.png",
+}
+
+def decide_spread(topic: str) -> Dict[str, Any]:
+    system_prompt = """
+너는 숙련된 타로 마스터야. 사용자의 질문을 분석해서 다음 중 어떤 타로 스프레드(배열)를 사용할지 결정해줘.
+- 1장: 간단한 조언
+- 2장: 선택지 비교, 양자택일  
+- 3장: 과거-현재-미래
+- 5장: 갈등/결정 분석
+- 6장: 관계나 연애 분석
+- 10장: 인생, 진로 등 복잡한 주제
+
+JSON 형식만 반환(코드블록 금지):
+{"spread":"3장","reason":"...","card_count":3}
+"""
+    res = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role":"system","content":system_prompt.strip()},
+            {"role":"user","content":topic}
+        ],
+        temperature=0.7,
+    )
+    text = res.choices[0].message.content.strip()
+    # 안전하게 eval 대신 json.loads 시도
+    try:
+        return json.loads(text)
+    except Exception:
+        # 실패 시 기본값(3장)
+        return {"spread":"3장","reason":"기본값으로 과거-현재-미래 흐름 확인","card_count":3}
+
+def gpt_card_reading(cards: List[Dict[str, Any]], topic: str) -> Dict[str, Any]:
+    """
+    cards = [{"name": "바보 카드.jpg", "reversed": True}, ...]
+    반환: {"items":[{name,position,keyword,meaning,advice},...],"summary":"..."}
+    """
+    cards_input = []
+    for c in cards:
+        name = c["name"].replace(".jpg", "")
+        keyword = CARD_KEYWORDS.get(c["name"], "키워드 없음")
+        position = "역방향" if c["reversed"] else "정방향"
+        cards_input.append({"name": name, "position": position, "keyword": keyword})
+
+    prompt = f"""
+당신은 숙련된 타로카드 리더입니다.
+'{topic}' 주제로 사용자가 아래 카드를 뽑았습니다.
+각 카드의 이름/방향/키워드가 주어집니다:
+
+{json.dumps(cards_input, ensure_ascii=False, indent=2)}
+
+다음 JSON 형식으로만 답변하세요(코드블록 금지):
+{{
+  "items": [
+    {{
+      "name": "카드 이름",
+      "position": "정방향/역방향",
+      "keyword": "간단 키워드",
+      "meaning": "카드 해석",
+      "advice": "사용자 조언"
+    }}
+  ],
+  "summary": "🧙 전체 해석: ..."
+}}
+"""
+    res = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role":"user","content":prompt.strip()}],
+        temperature=0.8,
+    )
+    txt = res.choices[0].message.content.strip()
+    try:
+        return json.loads(txt)
+    except Exception:
+        # 파싱 실패 시 통째로 텍스트를 summary로
+        return {"items": [], "summary": txt}
+
+# -------- Core flow --------
+def pick_random_cards(all_card_names: List[str], count: int) -> List[Dict[str, Any]]:
+    random.shuffle(all_card_names)
+    chosen = all_card_names[:count]
+    return [{"name": n, "reversed": random.choice([True, False])} for n in chosen]
+
+def list_all_cards() -> List[str]:
+    # public/card 아래 파일명을 URL 없이 리스트업
+    card_dir = os.path.join(BASE_DIR, "public", "card")
+    names = [f for f in os.listdir(card_dir) if f.lower().endswith(".jpg")]
+    return sorted(names)
+
+# -------- Dooray Slash Command --------
+class SlashPayload(BaseModel):
+    # Dooray가 보내는 실제 필드명은 조직 설정에 따라 다를 수 있음.
+    # 최소한 text, userId, channelId 같은 것만 참고.
+    text: str | None = None
+
+def verify_request(req: Request):
+    # 필요시 헤더/토큰 검증
+    expected = os.getenv("DOORAY_VERIFY_TOKEN")
+    if not expected:
+        return
+    got = req.headers.get("X-Dooray-Token") or req.headers.get("Authorization")
+    if got != expected:
+        raise HTTPException(status_code=401, detail="invalid token")
+
+@app.post("/dooray/command")
+async def dooray_command(req: Request):
+    """
+    예: /타로 [주제 텍스트]
+    Dooray Slash → 본 엔드포인트 호출 → attachments 응답
+    """
+    verify_request(req)
+    body = await req.json()
+    payload = SlashPayload(**body)
+    topic = (payload.text or "").strip() or "전반운"
+
+    # 1) 스프레드 결정(GPT)
+    spread_info = decide_spread(topic)
+    count = int(spread_info.get("card_count", 3))
+    reason = spread_info.get("reason", "해석을 위해")
+
+    # 2) 스프레드 이미지
+    spread_file = SPREAD_FILES.get(count, SPREAD_FILES[3])
+    spread_img_url = public_url(req, f"/card_spread/{spread_file}")
+
+    # 3) 액션(버튼): "카드 뽑기"
+    attachments = [
+        attachment_text_block(f"🧐 {reason} → **{count}장 스프레드**로 진행할게!"),
+        attachment_image_block(title=f"{count}장 스프레드", image_url=spread_img_url),
+        attachment_actions_block([
+            action_button(text="🔮 카드 무작위로 뽑기", name="action", value=f"draw_random:{count}", style="primary")
+        ])
+    ]
+    return make_message(
+        text=f"주제: {topic}",
+        attachments=attachments,
+        response_type="inChannel",  # 채널 전체 공개(원하면 ephemeral)
+        replace_original=False
+    )
+
+# -------- Dooray Interactive Actions --------
+@app.post("/dooray/actions")
+async def dooray_actions(req: Request):
+    """
+    Dooray 버튼/메뉴 액션 콜백
+    요청 바디에는 action name/value, callbackId 등이 포함됨.
+    """
+    verify_request(req)
+    data = await req.json()
+
+    # 일반적으로 data["actions"][0]["value"] 로 값이 온다고 가정
+    try:
+        actions = data.get("actions", [])
+        value = actions[0]["value"]  # e.g. "draw_random:3"
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid action payload")
+
+    # 파싱
+    if value.startswith("draw_random:"):
+        count = int(value.split(":")[1])
+
+        # 카드 목록 -> 무작위 선택
+        names = list_all_cards()
+        chosen_cards = pick_random_cards(names, count)
+
+        # GPT 해석
+        topic = data.get("originalMessage", {}).get("text", "전반운")  # 없으면 대체
+        reading = gpt_card_reading(chosen_cards, topic)
+
+        # 결과 attachments 만들기
+        atts: List[Dict[str, Any]] = []
+        # 카드별(이미지 + 설명)
+        for c in chosen_cards:
+            title = f"{c['name'].replace('.jpg','')} {'(역방향)' if c['reversed'] else '(정방향)'}"
+            img_url = public_url(req, f"/card/{c['name']}")
+            atts.append(attachment_image_block(title=title, image_url=img_url))
+
+        # GPT가 준 items를 필드로
+        if reading.get("items"):
+            fields = []
+            for item in reading["items"]:
+                fields.append({
+                    "title": f"🔮 {item.get('name','')}",
+                    "value": f"{item.get('position','')} | {item.get('keyword','')}\n👉 {item.get('meaning','')}\n💡 {item.get('advice','')}",
+                    "short": False
+                })
+            atts.append(attachment_fields_block(fields))
+
+        # 요약
+        if reading.get("summary"):
+            atts.append(attachment_text_block(reading["summary"]))
+
+        return make_message(
+            text="타로 결과",
+            attachments=atts,
+            response_type="inChannel",
+            replace_original=True  # 원본 메시지를 결과로 치환
+        )
+
+    # 지원 안 되는 액션
+    return make_message(text="지원하지 않는 액션이에요.", response_type="ephemeral")
+
+# --- 로컬 개발용 ---
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api.index:app", host="0.0.0.0", port=8000, reload=True)
