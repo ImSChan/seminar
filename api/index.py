@@ -3,8 +3,24 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Tuple
 from openai import OpenAI
 import os, json, random
+import logging, sys
+from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Dooray Tarot Bot")
+
+# ---------- 로깅 기본 설정 (stderr가 아닌 stdout로) ----------
+for h in logging.root.handlers[:]:
+    logging.root.removeHandler(h)
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    handlers=[logging.StreamHandler(sys.stdout)],
+    format="%(levelname)s %(asctime)s %(name)s : %(message)s",
+)
+
+logger = logging.getLogger("dooray-tarot")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
 
 # -------- OpenAI Client --------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -377,14 +393,19 @@ def verify_request(req: Request):
     got = req.headers.get("X-Dooray-Token") or req.headers.get("Authorization")
     if got != expected:
         raise HTTPException(status_code=401, detail="invalid token")
-
 @app.post("/dooray/command")
 async def dooray_command(req: Request):
     verify_request(req)
+
+    # (선택) 요청 원문도 찍고 싶으면 다음 2줄
+    raw = (await req.body()).decode("utf-8", "ignore")
+    logger.info("[IN] CT=%s RAW=%s", req.headers.get("content-type"), raw[:2000])
+
     data, is_action = await parse_dooray_payload(req)
 
     if is_action:  # 버튼 콜백
-        return await handle_actions(req, data)
+        payload = await handle_actions(req, data)   # dict를 반환한다고 가정
+        return respond(payload, tag="action")
 
     # 슬래시 커맨드 → 스프레드 결정
     topic = (data.get("text") or "").strip() or "전반운"
@@ -392,11 +413,57 @@ async def dooray_command(req: Request):
     count = int(spread_info.get("card_count", 3))
     seed = random.randint(1, 2_000_000_000)
 
-    # A안: 최초는 ephemeral + replaceOriginal:false
-    return build_pick_ui(
+    payload = build_pick_ui(
         req, count=count, picked=[], seed=seed, topic=topic,
         response_type="ephemeral", replace_original=False
+    )  # dict
+
+    return respond(payload, tag="slash-init")
+
+
+
+# ---------- 요청 로깅 미들웨어 ----------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    try:
+        raw = await request.body()
+    except Exception:
+        raw = b""
+
+    logger.info(
+        "[IN] %s %s CT=%s UA=%s XFWD=%s RAW=%s",
+        request.method,
+        request.url.path,
+        request.headers.get("content-type"),
+        request.headers.get("user-agent"),
+        request.headers.get("x-forwarded-for"),
+        (raw.decode("utf-8", "ignore")[:2000]),  # 너무 길면 자르기
     )
+
+    response = await call_next(request)
+
+    # 응답의 상태/타입 정도는 여기서 찍고, 실제 payload는 respond()에서 찍음
+    logger.info(
+        "[OUT] %s %s -> %s (%s)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        getattr(response, "media_type", None),
+    )
+    return response
+
+# ---------- 응답 헬퍼 ----------
+def respond(payload: Dict[str, Any], tag: str = "") -> JSONResponse:
+    """
+    Dooray로 보낼 payload를 stdout에 찍고 JSONResponse로 돌려준다.
+    tag는 어디서 보낸 응답인지 구분용 라벨.
+    """
+    try:
+        pretty = json.dumps(payload, ensure_ascii=False)
+    except Exception as e:
+        pretty = f"<< payload json.dumps 실패: {e} >>"
+    logger.info("[RESP%s] %s", f'/{tag}' if tag else "", pretty)
+    return JSONResponse(content=payload, media_type="application/json; charset=utf-8")
 
 # --- 로컬 개발용 ---
 if __name__ == "__main__":
