@@ -356,7 +356,42 @@ async def dooray_command(req: Request):
 
     topic = (data.get("text") or "").strip() or "전반운"
     return respond(build_confirm_ui(topic), tag="slash-confirm")
+@app.post("/gpt/ask")
+async def gpt_ask(req: Request):
+    verify_request(req)
 
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+
+    question = (data.get("question") or data.get("text") or "").strip()
+
+    if not question:
+        raise HTTPException(status_code=400, detail="question or text is required")
+
+    try:
+        res = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            messages=[
+                {
+                    "role": "user",
+                    "content": question
+                }
+            ],
+            temperature=0.7,
+        )
+
+        answer = res.choices[0].message.content or ""
+
+        return respond({
+            "question": question,
+            "answer": answer
+        }, tag="gpt-ask")
+
+    except Exception as e:
+        logger.exception("[GPT_ASK] failed: %s", e)
+        raise HTTPException(status_code=500, detail="GPT request failed")
 @app.post("/dooray/actions")
 async def dooray_actions(req: Request):
     verify_request(req)
