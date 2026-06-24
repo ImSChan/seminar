@@ -383,7 +383,7 @@ async def dooray_gpt(req: Request):
 
     try:
         res = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+            model=os.getenv("OPENAI_MODEL", "gpt-5.4"),
             messages=[
                 {"role": "user", "content": question}
             ],
