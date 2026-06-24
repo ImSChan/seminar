@@ -395,7 +395,7 @@ async def dooray_gpt(req: Request):
         return respond(
             make_message(
                 text=answer,
-                response_type="ephemeral",
+                response_type="inChannel",
                 replace_original=False
             ),
             tag="dooray-gpt"
