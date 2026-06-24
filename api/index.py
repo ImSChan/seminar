@@ -356,42 +356,61 @@ async def dooray_command(req: Request):
 
     topic = (data.get("text") or "").strip() or "전반운"
     return respond(build_confirm_ui(topic), tag="slash-confirm")
-@app.post("/gpt/ask")
-async def gpt_ask(req: Request):
+@app.post("/dooray/gpt")
+async def dooray_gpt(req: Request):
     verify_request(req)
 
-    try:
-        data = await req.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="JSON body required")
+    raw = (await req.body()).decode("utf-8", "ignore")
+    logger.info("[IN] POST /dooray/gpt CT=%s RAW=%s", req.headers.get("content-type"), raw[:2000])
 
-    question = (data.get("question") or data.get("text") or "").strip()
+    data, is_action = await parse_dooray_payload(req)
+
+    question = (
+        data.get("text")
+        or data.get("question")
+        or data.get("actionValue")
+        or ""
+    ).strip()
 
     if not question:
-        raise HTTPException(status_code=400, detail="question or text is required")
+        return respond(
+            make_message(
+                text="질문 내용을 입력해 주세요.",
+                response_type="ephemeral"
+            ),
+            tag="dooray-gpt-empty"
+        )
 
     try:
         res = client.chat.completions.create(
             model=os.getenv("OPENAI_MODEL", "gpt-4o"),
             messages=[
-                {
-                    "role": "user",
-                    "content": question
-                }
+                {"role": "user", "content": question}
             ],
             temperature=0.7,
         )
 
         answer = res.choices[0].message.content or ""
 
-        return respond({
-            "question": question,
-            "answer": answer
-        }, tag="gpt-ask")
+        return respond(
+            make_message(
+                text=answer,
+                response_type="ephemeral",
+                replace_original=False
+            ),
+            tag="dooray-gpt"
+        )
 
     except Exception as e:
-        logger.exception("[GPT_ASK] failed: %s", e)
-        raise HTTPException(status_code=500, detail="GPT request failed")
+        logger.exception("[DOORAY_GPT] failed: %s", e)
+
+        return respond(
+            make_message(
+                text="⚠️ GPT 질의 중 오류가 발생했어요. 로그를 확인해 주세요.",
+                response_type="ephemeral"
+            ),
+            tag="dooray-gpt-error"
+        )
 @app.post("/dooray/actions")
 async def dooray_actions(req: Request):
     verify_request(req)
