@@ -370,7 +370,7 @@ async def dooray_gpt(req: Request):
         or data.get("question")
         or data.get("actionValue")
         or ""
-    ).strip()
+    ).strip() + "**반드시 한국어로 대답!**"
 
     if not question:
         return respond(
