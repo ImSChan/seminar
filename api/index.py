@@ -343,7 +343,7 @@ def summarize_if_needed(chat: Dict[str, Any]):
                 },
             ],
             temperature=0.2,
-            max_completion_tokens=500,
+            max_completion_tokens=1000,
         )
 
         summary = res.choices[0].message.content or ""
@@ -361,9 +361,9 @@ def generate_chat_answer(session_key: str, question: str) -> str:
 
     res = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=messages,
+        messages=messages
         temperature=0.7,
-        max_completion_tokens=350,
+        max_completion_tokens=1000,
     )
 
     answer = res.choices[0].message.content or ""
