@@ -34,11 +34,10 @@ if not os.getenv("OPENAI_API_KEY"):
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 # ---------- Config ----------
-# 기존 500자 제한의 5배
-MAX_ANSWER_CHARS = int(os.getenv("MAX_ANSWER_CHARS", "2500"))
-
-# max_tokens 대신 max_completion_tokens 사용
-MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "1800"))
+# 글자 수 제한은 제거했습니다.
+# 단, OpenAI API 출력 토큰 제한은 필요합니다.
+# 길게 받고 싶으면 Vercel 환경변수에서 MAX_COMPLETION_TOKENS 값을 키우세요.
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "4096"))
 
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "8"))
 MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "1200"))
@@ -281,14 +280,14 @@ def save_chat(session_key: str, chat: Dict[str, Any]):
 
 
 def build_messages(chat: Dict[str, Any], user_input: str) -> List[Dict[str, str]]:
-    system_prompt = f"""
+    system_prompt = """
 너는 Dooray 메신저에서 동작하는 한국어 대화형 GPT 봇이다.
 
 규칙:
 - 사용자의 이전 대화 맥락과 요약 기억을 참고해서 자연스럽게 답한다.
 - 답변은 반드시 한국어로 한다.
-- 답변은 최대 {MAX_ANSWER_CHARS}자 이내로 작성한다.
-- 너무 불필요하게 장황하게 말하지 말고, 필요한 내용은 충분히 설명한다.
+- 필요한 내용은 충분히 설명한다.
+- 불필요하게 장황하게 반복하지 않는다.
 - 모르면 추측하지 말고 필요한 부분을 짧게 확인한다.
 - 코드 요청이면 바로 쓸 수 있게 핵심 코드나 수정 방향을 준다.
 - 사용자의 말투가 짧으면 답변도 간결하게 맞춘다.
@@ -321,15 +320,6 @@ def build_messages(chat: Dict[str, Any], user_input: str) -> List[Dict[str, str]
     )
 
     return messages
-
-
-def trim_answer(answer: str, max_chars: int = MAX_ANSWER_CHARS) -> str:
-    answer = (answer or "").strip()
-
-    if len(answer) <= max_chars:
-        return answer
-
-    return answer[:max_chars - 3].rstrip() + "..."
 
 
 def summarize_if_needed(chat: Dict[str, Any]):
@@ -403,7 +393,7 @@ def generate_chat_answer(session_key: str, question: str) -> str:
     )
 
     answer = res.choices[0].message.content or ""
-    answer = trim_answer(answer, MAX_ANSWER_CHARS)
+    answer = answer.strip()
 
     chat_messages = chat.get("messages") or []
 
@@ -464,7 +454,10 @@ def save_gpt_result(
         LATEST_REQUEST_BY_SESSION[session_key] = request_id
 
 
-def get_gpt_result(request_id: Optional[str], session_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def get_gpt_result(
+    request_id: Optional[str],
+    session_key: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     with STORE_LOCK:
         rid = request_id
 
@@ -597,7 +590,7 @@ async def dooray_gpt(req: Request, background_tasks: BackgroundTasks):
     - /dooray/gpt/result 에서 나중에 조회
     - 세션별 이전 대화 기록 유지
     - 오래된 대화는 요약해서 토큰 절약
-    - 답변은 기본 2500자 이하로 유도 및 최종 절단
+    - 답변 글자 수 제한 없음
     """
     verify_request(req)
 
@@ -745,7 +738,6 @@ async def dooray_gpt_debug(req: Request):
             "latestRequestId": LATEST_REQUEST_ID,
             "maxHistoryMessages": MAX_HISTORY_MESSAGES,
             "maxSummaryChars": MAX_SUMMARY_CHARS,
-            "maxAnswerChars": MAX_ANSWER_CHARS,
             "maxCompletionTokens": MAX_COMPLETION_TOKENS,
             "model": OPENAI_MODEL,
         }
