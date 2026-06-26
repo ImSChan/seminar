@@ -361,7 +361,7 @@ def generate_chat_answer(session_key: str, question: str) -> str:
 
     res = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=messages
+        messages=messages,
         temperature=0.7,
         max_completion_tokens=1000,
     )
