@@ -1,18 +1,16 @@
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 from openai import OpenAI
 import os
 import json
 import logging
 import sys
-import uuid
 import time
 import threading
-import io
-import zipfile
-import base64
-app = FastAPI(title="Dooray GPT Bot")
+import hashlib
+
+app = FastAPI(title="Dooray GPT Chat Bot")
 
 # ---------- Logging ----------
 for h in logging.root.handlers[:]:
@@ -24,7 +22,7 @@ logging.basicConfig(
     format="%(levelname)s %(asctime)s %(name)s : %(message)s",
 )
 
-logger = logging.getLogger("dooray-gpt")
+logger = logging.getLogger("dooray-gpt-chat")
 
 # ---------- OpenAI ----------
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -34,12 +32,14 @@ if not os.getenv("OPENAI_API_KEY"):
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
-# ---------- In-memory GPT Result Store ----------
-# 단일 프로세스 기준 저장소입니다.
-# 운영에서 여러 worker/process/serverless 환경이면 Redis/DB로 바꾸는 것을 권장합니다.
-GPT_RESULTS: Dict[str, Dict[str, Any]] = {}
-LATEST_REQUEST_ID: Optional[str] = None
+# ---------- Conversation Store ----------
+# 단일 프로세스 메모리 저장 방식입니다.
+# Vercel serverless / 다중 worker 환경에서는 Redis, DB로 교체 권장.
+CHAT_STORE: Dict[str, Dict[str, Any]] = {}
 STORE_LOCK = threading.Lock()
+
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "8"))
+MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "1200"))
 
 
 # ---------- Common Response ----------
@@ -62,7 +62,7 @@ def respond(payload: Dict[str, Any], tag: str = "") -> JSONResponse:
 def make_message(
     text: str,
     attachments=None,
-    response_type: str = "ephemeral",
+    response_type: str = "inChannel",
     replace_original: bool = False,
     delete_original: bool = False,
 ) -> Dict[str, Any]:
@@ -78,174 +78,7 @@ def make_message(
 
     return payload
 
-# ---------- Public URL Helper ----------
-def public_url(request: Request, path: str) -> str:
-    base = os.getenv("APP_BASE_URL")
 
-    if not base:
-        scheme = request.url.scheme
-        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
-        base = f"{scheme}://{host}"
-
-    return f"{base}{path}"
-
-
-# ---------- File Send Test ----------
-def build_test_xlsx_bytes() -> bytes:
-    """
-    외부 라이브러리 없이 최소 xlsx 파일 생성
-    """
-    buffer = io.BytesIO()
-
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(
-            "[Content_Types].xml",
-            """<?xml version="1.0" encoding="UTF-8"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-  <Default Extension="xml" ContentType="application/xml"/>
-  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>""",
-        )
-
-        z.writestr(
-            "_rels/.rels",
-            """<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>""",
-        )
-
-        z.writestr(
-            "xl/workbook.xml",
-            """<?xml version="1.0" encoding="UTF-8"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-  <sheets>
-    <sheet name="Test" sheetId="1" r:id="rId1"/>
-  </sheets>
-</workbook>""",
-        )
-
-        z.writestr(
-            "xl/_rels/workbook.xml.rels",
-            """<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>""",
-        )
-
-        z.writestr(
-            "xl/worksheets/sheet1.xml",
-            """<?xml version="1.0" encoding="UTF-8"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-  <sheetData>
-    <row r="1">
-      <c r="A1" t="inlineStr">
-        <is><t>Dooray file test</t></is>
-      </c>
-    </row>
-  </sheetData>
-</worksheet>""",
-        )
-
-    return buffer.getvalue()
-
-
-def get_test_file(filename: str) -> tuple[bytes, str]:
-    filename = filename.lower().strip()
-
-    if filename == "sample.png":
-        # 1x1 png
-        return (
-            base64.b64decode(
-                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-            ),
-            "image/png",
-        )
-
-    if filename == "sample.txt":
-        return (
-            "Dooray imageUrl 파일 전송 테스트용 TXT 파일입니다.\n".encode("utf-8"),
-            "text/plain; charset=utf-8",
-        )
-
-    if filename == "sample.csv":
-        return (
-            "name,value\nDooray File Test,123\n".encode("utf-8-sig"),
-            "text/csv; charset=utf-8",
-        )
-
-    if filename == "sample.pdf":
-        pdf = b"""%PDF-1.4
-1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
-endobj
-2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
-endobj
-3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R >>
-endobj
-4 0 obj
-<< /Length 44 >>
-stream
-BT /F1 18 Tf 40 80 Td (Dooray file test) Tj ET
-endstream
-endobj
-xref
-0 5
-0000000000 65535 f 
-0000000009 00000 n 
-0000000058 00000 n 
-0000000115 00000 n 
-0000000204 00000 n 
-trailer
-<< /Root 1 0 R /Size 5 >>
-startxref
-297
-%%EOF
-"""
-        return pdf, "application/pdf"
-
-    if filename == "sample.xlsx":
-        return (
-            build_test_xlsx_bytes(),
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    raise HTTPException(status_code=404, detail="test file not found")
-
-
-def parse_file_test_target(value: str | None) -> list[str]:
-    v = (value or "").strip().lower().lstrip(".")
-
-    if not v or v in ("all", "전체", "전부"):
-        return ["sample.png", "sample.txt", "sample.csv", "sample.pdf", "sample.xlsx"]
-
-    mapping = {
-        "png": "sample.png",
-        "image": "sample.png",
-        "img": "sample.png",
-        "txt": "sample.txt",
-        "text": "sample.txt",
-        "csv": "sample.csv",
-        "pdf": "sample.pdf",
-        "xlsx": "sample.xlsx",
-        "excel": "sample.xlsx",
-        "엑셀": "sample.xlsx",
-    }
-
-    filename = mapping.get(v)
-
-    if not filename:
-        raise HTTPException(
-            status_code=400,
-            detail="지원 확장자: png, txt, csv, pdf, xlsx, all",
-        )
-
-    return [filename]
 # ---------- Verify ----------
 def verify_request(req: Request):
     expected = os.getenv("DOORAY_VERIFY_TOKEN")
@@ -263,7 +96,6 @@ def verify_request(req: Request):
 async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
     ctype = (req.headers.get("content-type") or "").lower()
 
-    # JSON 우선 처리
     if "application/json" in ctype:
         try:
             data = await req.json()
@@ -293,7 +125,6 @@ async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
         except Exception as e:
             logger.warning("[PARSE/JSON] failed: %s", e)
 
-    # FORM 처리
     form = await req.form()
     data: Dict[str, Any] = {}
 
@@ -335,6 +166,7 @@ async def parse_dooray_payload(req: Request) -> Tuple[Dict[str, Any], bool]:
     return data, is_action
 
 
+# ---------- Extract Helpers ----------
 def extract_question(data: Dict[str, Any]) -> str:
     question = (
         data.get("text")
@@ -348,92 +180,223 @@ def extract_question(data: Dict[str, Any]) -> str:
     return str(question).strip()
 
 
-def extract_request_id(data: Dict[str, Any], req: Request) -> Optional[str]:
-    request_id = (
-        data.get("requestId")
-        or data.get("request_id")
-        or data.get("id")
-        or data.get("text")
-        or req.query_params.get("requestId")
-        or req.query_params.get("request_id")
-        or req.query_params.get("id")
+def extract_session_key(data: Dict[str, Any], req: Request) -> str:
+    """
+    Dooray payload 구조가 환경마다 다를 수 있어서 여러 후보값을 사용합니다.
+
+    우선순위:
+    1. 명시적 sessionId/channelId/threadId
+    2. Dooray sender/channel 관련 필드
+    3. IP 기반 fallback
+    """
+    candidate = (
+        data.get("sessionId")
+        or data.get("session_id")
+        or data.get("threadId")
+        or data.get("thread_id")
+        or data.get("channelId")
+        or data.get("channel_id")
+        or data.get("roomId")
+        or data.get("room_id")
+        or data.get("userId")
+        or data.get("user_id")
+        or data.get("senderId")
+        or data.get("sender_id")
     )
 
-    if request_id is None:
-        return None
+    if not candidate:
+        user = data.get("user") or {}
+        channel = data.get("channel") or {}
 
-    request_id = str(request_id).strip()
+        if isinstance(user, dict):
+            candidate = candidate or user.get("id") or user.get("name")
 
-    return request_id or None
+        if isinstance(channel, dict):
+            channel_id = channel.get("id") or channel.get("name")
+            if channel_id:
+                candidate = f"{channel_id}:{candidate or 'unknown'}"
+
+    if not candidate:
+        client_host = req.client.host if req.client else "unknown"
+        raw = f"{client_host}:{req.headers.get('user-agent', '')}"
+        candidate = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    return str(candidate)
 
 
-def save_result(
-    request_id: str,
-    status: str,
-    question: str,
-    answer: str = "",
-    error: str = "",
-):
-    global LATEST_REQUEST_ID
-
+# ---------- Conversation Memory ----------
+def get_or_create_chat(session_key: str) -> Dict[str, Any]:
     with STORE_LOCK:
-        GPT_RESULTS[request_id] = {
-            "requestId": request_id,
-            "status": status,
-            "question": question,
-            "answer": answer,
-            "error": error,
-            "createdAt": GPT_RESULTS.get(request_id, {}).get("createdAt") or time.time(),
-            "updatedAt": time.time(),
+        if session_key not in CHAT_STORE:
+            CHAT_STORE[session_key] = {
+                "summary": "",
+                "messages": [],
+                "createdAt": time.time(),
+                "updatedAt": time.time(),
+            }
+
+        return CHAT_STORE[session_key]
+
+
+def save_chat(session_key: str, chat: Dict[str, Any]):
+    with STORE_LOCK:
+        chat["updatedAt"] = time.time()
+        CHAT_STORE[session_key] = chat
+
+
+def build_messages(chat: Dict[str, Any], user_input: str) -> List[Dict[str, str]]:
+    system_prompt = """
+너는 Dooray 메신저에서 동작하는 한국어 대화형 GPT 봇이다.
+
+규칙:
+- 사용자의 이전 대화 맥락과 요약 기억을 참고해서 자연스럽게 답한다.
+- 답변은 반드시 한국어로 한다.
+- 답변은 반드시 500자를 넘기지 않는다.
+- 너무 장황하게 설명하지 말고 핵심만 말한다.
+- 모르면 추측하지 말고 필요한 부분을 짧게 확인한다.
+- 코드 요청이면 바로 쓸 수 있게 핵심 코드나 수정 방향을 준다.
+- 사용자의 말투가 짧으면 답변도 간결하게 맞춘다.
+""".strip()
+
+    messages: List[Dict[str, str]] = [
+        {
+            "role": "system",
+            "content": system_prompt,
         }
+    ]
 
-        LATEST_REQUEST_ID = request_id
+    summary = chat.get("summary") or ""
+    if summary:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"이전 대화 요약 기억:\n{summary}",
+            }
+        )
+
+    history = chat.get("messages") or []
+    messages.extend(history[-MAX_HISTORY_MESSAGES:])
+
+    messages.append(
+        {
+            "role": "user",
+            "content": user_input,
+        }
+    )
+
+    return messages
 
 
-def get_result(request_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    with STORE_LOCK:
-        rid = request_id or LATEST_REQUEST_ID
+def trim_answer(answer: str, max_chars: int = 500) -> str:
+    answer = (answer or "").strip()
 
-        if not rid:
-            return None
+    if len(answer) <= max_chars:
+        return answer
 
-        return GPT_RESULTS.get(rid)
+    return answer[:max_chars - 3].rstrip() + "..."
 
 
-def generate_gpt_answer(request_id: str, question: str):
-    logger.info("[GPT] start request_id=%s question=%s", request_id, question[:500])
+def summarize_if_needed(chat: Dict[str, Any]):
+    """
+    토큰 절약용 요약.
+    메시지가 일정 개수 이상 쌓이면 오래된 대화를 summary로 압축하고,
+    최근 메시지만 남깁니다.
+    """
+    messages = chat.get("messages") or []
+
+    if len(messages) <= MAX_HISTORY_MESSAGES * 2:
+        return
+
+    old_messages = messages[:-MAX_HISTORY_MESSAGES]
+    recent_messages = messages[-MAX_HISTORY_MESSAGES:]
+
+    old_text = "\n".join(
+        f"{m.get('role')}: {m.get('content')}"
+        for m in old_messages
+    )
+
+    previous_summary = chat.get("summary") or ""
+
+    prompt = f"""
+아래 대화를 이후 대화에 필요한 기억만 남기도록 한국어로 짧게 요약해줘.
+중요한 사용자 선호, 진행 중인 작업, 결정사항, 코드 구조만 유지해.
+최대 {MAX_SUMMARY_CHARS}자 이내.
+
+기존 요약:
+{previous_summary}
+
+추가 대화:
+{old_text}
+""".strip()
 
     try:
-        prompt = f"{question}\n\n반드시 한국어로 대답해줘."
-
         res = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "너는 대화 기록을 토큰 절약용으로 압축 요약하는 도우미다.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
             ],
-            temperature=0.7,
+            temperature=0.2,
+            max_tokens=500,
         )
 
-        answer = res.choices[0].message.content or ""
-
-        save_result(
-            request_id=request_id,
-            status="done",
-            question=question,
-            answer=answer,
-        )
-
-        logger.info("[GPT] done request_id=%s answer_len=%d", request_id, len(answer))
+        summary = res.choices[0].message.content or ""
+        chat["summary"] = summary[:MAX_SUMMARY_CHARS]
+        chat["messages"] = recent_messages
 
     except Exception as e:
-        logger.exception("[GPT] failed request_id=%s error=%s", request_id, e)
+        logger.warning("[SUMMARY] failed: %s", e)
+        chat["messages"] = recent_messages
 
-        save_result(
-            request_id=request_id,
-            status="error",
-            question=question,
-            error=str(e),
-        )
+
+def generate_chat_answer(session_key: str, question: str) -> str:
+    chat = get_or_create_chat(session_key)
+    messages = build_messages(chat, question)
+
+    res = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=350,
+    )
+
+    answer = res.choices[0].message.content or ""
+    answer = trim_answer(answer, 500)
+
+    chat_messages = chat.get("messages") or []
+
+    chat_messages.append(
+        {
+            "role": "user",
+            "content": question,
+        }
+    )
+
+    chat_messages.append(
+        {
+            "role": "assistant",
+            "content": answer,
+        }
+    )
+
+    chat["messages"] = chat_messages
+
+    summarize_if_needed(chat)
+    save_chat(session_key, chat)
+
+    return answer
+
+
+def reset_chat(session_key: str):
+    with STORE_LOCK:
+        if session_key in CHAT_STORE:
+            del CHAT_STORE[session_key]
 
 
 # ---------- Endpoints ----------
@@ -441,7 +404,7 @@ def generate_gpt_answer(request_id: str, question: str):
 async def root():
     return {
         "status": "ok",
-        "service": "dooray-gpt",
+        "service": "dooray-gpt-chat",
     }
 
 
@@ -453,16 +416,14 @@ async def health():
 
 
 @app.post("/dooray/gpt")
-async def dooray_gpt(req: Request, background_tasks: BackgroundTasks):
+async def dooray_gpt(req: Request):
     """
-    GPT 질문 접수 엔드포인트.
+    Dooray 대화형 GPT 엔드포인트.
 
-    동작:
-    1. Dooray에서 질문 수신
-    2. requestId 생성
-    3. GPT 응답 생성을 백그라운드로 실행
-    4. 이 엔드포인트에서는 GPT 답변을 바로 리턴하지 않음
-    5. /dooray/gpt/result 에서 나중에 조회
+    - 질문을 받으면 바로 GPT 답변 반환
+    - 세션별 이전 대화 기록 유지
+    - 오래된 대화는 요약해서 토큰 절약
+    - 답변은 500자 이하로 유도 및 최종 절단
     """
     verify_request(req)
 
@@ -475,6 +436,7 @@ async def dooray_gpt(req: Request, background_tasks: BackgroundTasks):
 
     data, _ = await parse_dooray_payload(req)
     question = extract_question(data)
+    session_key = extract_session_key(data, req)
 
     if not question:
         return respond(
@@ -485,208 +447,77 @@ async def dooray_gpt(req: Request, background_tasks: BackgroundTasks):
             tag="gpt-empty",
         )
 
-    request_id = str(uuid.uuid4())
-
-    save_result(
-        request_id=request_id,
-        status="processing",
-        question=question,
-    )
-
-    background_tasks.add_task(generate_gpt_answer, request_id, question)
-
-    return respond(
-        make_message(
-            text=(
-                "질의를 접수했습니다.\n"
-                f"요청 ID: `{request_id}`\n\n"
-                "응답은 잠시 후 결과 조회 엔드포인트에서 가져오면 됩니다."
+    if question.strip() in ["/reset", "reset", "초기화", "대화초기화"]:
+        reset_chat(session_key)
+        return respond(
+            make_message(
+                text="대화 기억을 초기화했습니다.",
+                response_type="ephemeral",
             ),
-            response_type="ephemeral",
-            replace_original=False,
-        ),
-        tag="gpt-accepted",
-    )
+            tag="gpt-reset",
+        )
+
+    try:
+        answer = generate_chat_answer(session_key, question)
+
+        return respond(
+            make_message(
+                text=answer,
+                response_type="inChannel",
+                replace_original=False,
+            ),
+            tag="gpt-chat",
+        )
+
+    except Exception as e:
+        logger.exception("[GPT_CHAT] failed: %s", e)
+
+        return respond(
+            make_message(
+                text="⚠️ GPT 응답 생성 중 오류가 발생했습니다. 로그를 확인해 주세요.",
+                response_type="ephemeral",
+            ),
+            tag="gpt-chat-error",
+        )
 
 
-@app.post("/dooray/gpt/result")
-async def dooray_gpt_result_post(req: Request):
+@app.post("/dooray/gpt/reset")
+async def dooray_gpt_reset(req: Request):
     """
-    GPT 결과 조회 엔드포인트 - POST 방식.
-
-    Dooray slash command나 webhook에서 호출하기 좋게 POST 지원.
-    text/requestId/id 중 하나로 requestId를 받을 수 있음.
-    requestId가 없으면 가장 최근 요청 결과를 반환.
+    현재 세션의 대화 기억 초기화.
     """
     verify_request(req)
-
-    raw = (await req.body()).decode("utf-8", "ignore")
-    logger.info(
-        "[IN] POST /dooray/gpt/result CT=%s RAW=%s",
-        req.headers.get("content-type"),
-        raw[:2000],
-    )
 
     data, _ = await parse_dooray_payload(req)
-    request_id = extract_request_id(data, req)
-    result = get_result(request_id)
+    session_key = extract_session_key(data, req)
 
-    return build_result_response(result)
-
-
-@app.get("/dooray/gpt/result")
-async def dooray_gpt_result_get(req: Request):
-    """
-    GPT 결과 조회 엔드포인트 - GET 방식.
-
-    예:
-    /dooray/gpt/result?id=요청ID
-    /dooray/gpt/result?requestId=요청ID
-
-    id/requestId가 없으면 가장 최근 요청 결과를 반환.
-    """
-    verify_request(req)
-
-    request_id = extract_request_id({}, req)
-    result = get_result(request_id)
-
-    return build_result_response(result)
-
-
-def build_result_response(result: Optional[Dict[str, Any]]) -> JSONResponse:
-    if not result:
-        return respond(
-            make_message(
-                text="조회 가능한 GPT 응답이 없습니다.",
-                response_type="ephemeral",
-            ),
-            tag="gpt-result-empty",
-        )
-
-    status = result.get("status")
-    request_id = result.get("requestId")
-    question = result.get("question") or ""
-
-    if status == "processing":
-        return respond(
-            make_message(
-                text=(
-                    "아직 GPT 응답을 생성 중입니다.\n"
-                    f"요청 ID: `{request_id}`\n"
-                    f"질문: {question}"
-                ),
-                response_type="ephemeral",
-            ),
-            tag="gpt-result-processing",
-        )
-
-    if status == "error":
-        return respond(
-            make_message(
-                text=(
-                    "⚠️ GPT 질의 중 오류가 발생했습니다.\n"
-                    f"요청 ID: `{request_id}`\n"
-                    f"오류: {result.get('error') or 'unknown error'}"
-                ),
-                response_type="ephemeral",
-            ),
-            tag="gpt-result-error",
-        )
-
-    answer = result.get("answer") or ""
+    reset_chat(session_key)
 
     return respond(
         make_message(
-            text=answer,
-            response_type="inChannel",
-            replace_original=False,
-        ),
-        tag="gpt-result-done",
-    )
-@app.get("/test-files/{filename}")
-async def serve_test_file(filename: str):
-    """
-    Dooray imageUrl 테스트용 파일 제공 엔드포인트.
-
-    예:
-    /test-files/sample.png
-    /test-files/sample.pdf
-    /test-files/sample.txt
-    /test-files/sample.csv
-    /test-files/sample.xlsx
-    """
-    content, media_type = get_test_file(filename)
-
-    return Response(
-        content=content,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f'inline; filename="{filename}"'
-        },
-    )
-
-
-@app.api_route("/dooray/file-test", methods=["GET", "POST"])
-async def dooray_file_test(req: Request):
-    """
-    Dooray 메시지 attachments.imageUrl 에 이미지가 아닌 파일 URL을 넣었을 때
-    첨부파일처럼 보이는지 테스트하는 엔드포인트.
-
-    GET 테스트:
-    /dooray/file-test?ext=pdf
-    /dooray/file-test?ext=xlsx
-    /dooray/file-test?ext=all
-
-    POST slash command 테스트:
-    text 값에 pdf, txt, csv, xlsx, png, all 입력
-    """
-    verify_request(req)
-
-    ext = req.query_params.get("ext")
-
-    if req.method == "POST":
-        raw = (await req.body()).decode("utf-8", "ignore")
-        logger.info(
-            "[IN] POST /dooray/file-test CT=%s RAW=%s",
-            req.headers.get("content-type"),
-            raw[:2000],
-        )
-
-        data, _ = await parse_dooray_payload(req)
-        ext = ext or extract_question(data)
-
-    filenames = parse_file_test_target(ext)
-
-    attachments = []
-
-    for filename in filenames:
-        file_url = public_url(req, f"/test-files/{filename}")
-
-        attachments.append(
-            {
-                "title": f"imageUrl 테스트 - {filename}",
-                "text": (
-                    "이 attachment는 일반 첨부 API가 아니라 "
-                    "`imageUrl` 필드에 파일 URL을 넣은 테스트입니다.\n\n"
-                    f"직접 링크: {file_url}"
-                ),
-                "imageUrl": file_url,
-            }
-        )
-
-    return respond(
-        make_message(
-            text=(
-                "파일 전송 테스트 메시지입니다.\n"
-                "`attachments.imageUrl`에 이미지/문서/엑셀 파일 URL을 넣었습니다.\n\n"
-                "Dooray에서 이미지가 아닌 확장자를 첨부파일처럼 처리하는지 확인해보세요."
-            ),
-            attachments=attachments,
+            text="대화 기억을 초기화했습니다.",
             response_type="ephemeral",
-            replace_original=False,
         ),
-        tag="file-test",
+        tag="gpt-reset",
     )
+
+
+@app.get("/dooray/gpt/debug")
+async def dooray_gpt_debug(req: Request):
+    """
+    간단 디버그용.
+    운영에서 필요 없으면 삭제해도 됩니다.
+    """
+    verify_request(req)
+
+    with STORE_LOCK:
+        return {
+            "sessionCount": len(CHAT_STORE),
+            "maxHistoryMessages": MAX_HISTORY_MESSAGES,
+            "maxSummaryChars": MAX_SUMMARY_CHARS,
+            "model": OPENAI_MODEL,
+        }
+
 
 # ----- Local run -----
 if __name__ == "__main__":
