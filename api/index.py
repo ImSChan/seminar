@@ -9,7 +9,9 @@ import sys
 import uuid
 import time
 import threading
-
+import io
+import zipfile
+import base64
 app = FastAPI(title="Dooray GPT Bot")
 
 # ---------- Logging ----------
@@ -76,7 +78,174 @@ def make_message(
 
     return payload
 
+# ---------- Public URL Helper ----------
+def public_url(request: Request, path: str) -> str:
+    base = os.getenv("APP_BASE_URL")
 
+    if not base:
+        scheme = request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+        base = f"{scheme}://{host}"
+
+    return f"{base}{path}"
+
+
+# ---------- File Send Test ----------
+def build_test_xlsx_bytes() -> bytes:
+    """
+    외부 라이브러리 없이 최소 xlsx 파일 생성
+    """
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>""",
+        )
+
+        z.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""",
+        )
+
+        z.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Test" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>""",
+        )
+
+        z.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>""",
+        )
+
+        z.writestr(
+            "xl/worksheets/sheet1.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr">
+        <is><t>Dooray file test</t></is>
+      </c>
+    </row>
+  </sheetData>
+</worksheet>""",
+        )
+
+    return buffer.getvalue()
+
+
+def get_test_file(filename: str) -> tuple[bytes, str]:
+    filename = filename.lower().strip()
+
+    if filename == "sample.png":
+        # 1x1 png
+        return (
+            base64.b64decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+            ),
+            "image/png",
+        )
+
+    if filename == "sample.txt":
+        return (
+            "Dooray imageUrl 파일 전송 테스트용 TXT 파일입니다.\n".encode("utf-8"),
+            "text/plain; charset=utf-8",
+        )
+
+    if filename == "sample.csv":
+        return (
+            "name,value\nDooray File Test,123\n".encode("utf-8-sig"),
+            "text/csv; charset=utf-8",
+        )
+
+    if filename == "sample.pdf":
+        pdf = b"""%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 44 >>
+stream
+BT /F1 18 Tf 40 80 Td (Dooray file test) Tj ET
+endstream
+endobj
+xref
+0 5
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000204 00000 n 
+trailer
+<< /Root 1 0 R /Size 5 >>
+startxref
+297
+%%EOF
+"""
+        return pdf, "application/pdf"
+
+    if filename == "sample.xlsx":
+        return (
+            build_test_xlsx_bytes(),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    raise HTTPException(status_code=404, detail="test file not found")
+
+
+def parse_file_test_target(value: str | None) -> list[str]:
+    v = (value or "").strip().lower().lstrip(".")
+
+    if not v or v in ("all", "전체", "전부"):
+        return ["sample.png", "sample.txt", "sample.csv", "sample.pdf", "sample.xlsx"]
+
+    mapping = {
+        "png": "sample.png",
+        "image": "sample.png",
+        "img": "sample.png",
+        "txt": "sample.txt",
+        "text": "sample.txt",
+        "csv": "sample.csv",
+        "pdf": "sample.pdf",
+        "xlsx": "sample.xlsx",
+        "excel": "sample.xlsx",
+        "엑셀": "sample.xlsx",
+    }
+
+    filename = mapping.get(v)
+
+    if not filename:
+        raise HTTPException(
+            status_code=400,
+            detail="지원 확장자: png, txt, csv, pdf, xlsx, all",
+        )
+
+    return [filename]
 # ---------- Verify ----------
 def verify_request(req: Request):
     expected = os.getenv("DOORAY_VERIFY_TOKEN")
@@ -434,7 +603,90 @@ def build_result_response(result: Optional[Dict[str, Any]]) -> JSONResponse:
         ),
         tag="gpt-result-done",
     )
+@app.get("/test-files/{filename}")
+async def serve_test_file(filename: str):
+    """
+    Dooray imageUrl 테스트용 파일 제공 엔드포인트.
 
+    예:
+    /test-files/sample.png
+    /test-files/sample.pdf
+    /test-files/sample.txt
+    /test-files/sample.csv
+    /test-files/sample.xlsx
+    """
+    content, media_type = get_test_file(filename)
+
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"'
+        },
+    )
+
+
+@app.api_route("/dooray/file-test", methods=["GET", "POST"])
+async def dooray_file_test(req: Request):
+    """
+    Dooray 메시지 attachments.imageUrl 에 이미지가 아닌 파일 URL을 넣었을 때
+    첨부파일처럼 보이는지 테스트하는 엔드포인트.
+
+    GET 테스트:
+    /dooray/file-test?ext=pdf
+    /dooray/file-test?ext=xlsx
+    /dooray/file-test?ext=all
+
+    POST slash command 테스트:
+    text 값에 pdf, txt, csv, xlsx, png, all 입력
+    """
+    verify_request(req)
+
+    ext = req.query_params.get("ext")
+
+    if req.method == "POST":
+        raw = (await req.body()).decode("utf-8", "ignore")
+        logger.info(
+            "[IN] POST /dooray/file-test CT=%s RAW=%s",
+            req.headers.get("content-type"),
+            raw[:2000],
+        )
+
+        data, _ = await parse_dooray_payload(req)
+        ext = ext or extract_question(data)
+
+    filenames = parse_file_test_target(ext)
+
+    attachments = []
+
+    for filename in filenames:
+        file_url = public_url(req, f"/test-files/{filename}")
+
+        attachments.append(
+            {
+                "title": f"imageUrl 테스트 - {filename}",
+                "text": (
+                    "이 attachment는 일반 첨부 API가 아니라 "
+                    "`imageUrl` 필드에 파일 URL을 넣은 테스트입니다.\n\n"
+                    f"직접 링크: {file_url}"
+                ),
+                "imageUrl": file_url,
+            }
+        )
+
+    return respond(
+        make_message(
+            text=(
+                "파일 전송 테스트 메시지입니다.\n"
+                "`attachments.imageUrl`에 이미지/문서/엑셀 파일 URL을 넣었습니다.\n\n"
+                "Dooray에서 이미지가 아닌 확장자를 첨부파일처럼 처리하는지 확인해보세요."
+            ),
+            attachments=attachments,
+            response_type="ephemeral",
+            replace_original=False,
+        ),
+        tag="file-test",
+    )
 
 # ----- Local run -----
 if __name__ == "__main__":
