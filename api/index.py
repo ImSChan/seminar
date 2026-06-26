@@ -363,7 +363,7 @@ def generate_chat_answer(session_key: str, question: str) -> str:
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.7,
-        max_tokens=350,
+        max_completion_tokens=350,
     )
 
     answer = res.choices[0].message.content or ""
