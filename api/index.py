@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 from openai import OpenAI
 import os
 import json
@@ -9,6 +9,7 @@ import sys
 import time
 import threading
 import hashlib
+import uuid
 
 app = FastAPI(title="Dooray GPT Chat Bot")
 
@@ -32,14 +33,31 @@ if not os.getenv("OPENAI_API_KEY"):
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
+# ---------- Config ----------
+# 기존 500자 제한의 5배
+MAX_ANSWER_CHARS = int(os.getenv("MAX_ANSWER_CHARS", "2500"))
+
+# max_tokens 대신 max_completion_tokens 사용
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "1800"))
+
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "8"))
+MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "1200"))
+
 # ---------- Conversation Store ----------
 # 단일 프로세스 메모리 저장 방식입니다.
 # Vercel serverless / 다중 worker 환경에서는 Redis, DB로 교체 권장.
 CHAT_STORE: Dict[str, Dict[str, Any]] = {}
-STORE_LOCK = threading.Lock()
 
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "8"))
-MAX_SUMMARY_CHARS = int(os.getenv("MAX_SUMMARY_CHARS", "1200"))
+# GPT 결과 저장소
+GPT_RESULTS: Dict[str, Dict[str, Any]] = {}
+
+# 세션별 최신 requestId 저장
+LATEST_REQUEST_BY_SESSION: Dict[str, str] = {}
+
+# 전체 최신 requestId 저장
+LATEST_REQUEST_ID: Optional[str] = None
+
+STORE_LOCK = threading.Lock()
 
 
 # ---------- Common Response ----------
@@ -180,6 +198,24 @@ def extract_question(data: Dict[str, Any]) -> str:
     return str(question).strip()
 
 
+def extract_request_id(data: Dict[str, Any], req: Request) -> Optional[str]:
+    request_id = (
+        data.get("requestId")
+        or data.get("request_id")
+        or data.get("id")
+        or req.query_params.get("requestId")
+        or req.query_params.get("request_id")
+        or req.query_params.get("id")
+    )
+
+    if request_id is None:
+        return None
+
+    request_id = str(request_id).strip()
+
+    return request_id or None
+
+
 def extract_session_key(data: Dict[str, Any], req: Request) -> str:
     """
     Dooray payload 구조가 환경마다 다를 수 있어서 여러 후보값을 사용합니다.
@@ -245,14 +281,14 @@ def save_chat(session_key: str, chat: Dict[str, Any]):
 
 
 def build_messages(chat: Dict[str, Any], user_input: str) -> List[Dict[str, str]]:
-    system_prompt = """
+    system_prompt = f"""
 너는 Dooray 메신저에서 동작하는 한국어 대화형 GPT 봇이다.
 
 규칙:
 - 사용자의 이전 대화 맥락과 요약 기억을 참고해서 자연스럽게 답한다.
 - 답변은 반드시 한국어로 한다.
-- 답변은 반드시 500자를 넘기지 않는다.
-- 너무 장황하게 설명하지 말고 핵심만 말한다.
+- 답변은 최대 {MAX_ANSWER_CHARS}자 이내로 작성한다.
+- 너무 불필요하게 장황하게 말하지 말고, 필요한 내용은 충분히 설명한다.
 - 모르면 추측하지 말고 필요한 부분을 짧게 확인한다.
 - 코드 요청이면 바로 쓸 수 있게 핵심 코드나 수정 방향을 준다.
 - 사용자의 말투가 짧으면 답변도 간결하게 맞춘다.
@@ -287,7 +323,7 @@ def build_messages(chat: Dict[str, Any], user_input: str) -> List[Dict[str, str]
     return messages
 
 
-def trim_answer(answer: str, max_chars: int = 500) -> str:
+def trim_answer(answer: str, max_chars: int = MAX_ANSWER_CHARS) -> str:
     answer = (answer or "").strip()
 
     if len(answer) <= max_chars:
@@ -343,7 +379,7 @@ def summarize_if_needed(chat: Dict[str, Any]):
                 },
             ],
             temperature=0.2,
-            max_completion_tokens=1000,
+            max_completion_tokens=700,
         )
 
         summary = res.choices[0].message.content or ""
@@ -363,11 +399,11 @@ def generate_chat_answer(session_key: str, question: str) -> str:
         model=OPENAI_MODEL,
         messages=messages,
         temperature=0.7,
-        max_completion_tokens=1000,
+        max_completion_tokens=MAX_COMPLETION_TOKENS,
     )
 
     answer = res.choices[0].message.content or ""
-    answer = trim_answer(answer, 500)
+    answer = trim_answer(answer, MAX_ANSWER_CHARS)
 
     chat_messages = chat.get("messages") or []
 
@@ -399,6 +435,140 @@ def reset_chat(session_key: str):
             del CHAT_STORE[session_key]
 
 
+# ---------- Result Store ----------
+def save_gpt_result(
+    request_id: str,
+    session_key: str,
+    status: str,
+    question: str,
+    answer: str = "",
+    error: str = "",
+):
+    global LATEST_REQUEST_ID
+
+    with STORE_LOCK:
+        old = GPT_RESULTS.get(request_id) or {}
+
+        GPT_RESULTS[request_id] = {
+            "requestId": request_id,
+            "sessionKey": session_key,
+            "status": status,
+            "question": question,
+            "answer": answer,
+            "error": error,
+            "createdAt": old.get("createdAt") or time.time(),
+            "updatedAt": time.time(),
+        }
+
+        LATEST_REQUEST_ID = request_id
+        LATEST_REQUEST_BY_SESSION[session_key] = request_id
+
+
+def get_gpt_result(request_id: Optional[str], session_key: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    with STORE_LOCK:
+        rid = request_id
+
+        if not rid and session_key:
+            rid = LATEST_REQUEST_BY_SESSION.get(session_key)
+
+        if not rid:
+            rid = LATEST_REQUEST_ID
+
+        if not rid:
+            return None
+
+        return GPT_RESULTS.get(rid)
+
+
+def generate_and_store_gpt_answer(request_id: str, session_key: str, question: str):
+    logger.info(
+        "[GPT_ASYNC] start request_id=%s session_key=%s question=%s",
+        request_id,
+        session_key,
+        question[:500],
+    )
+
+    try:
+        answer = generate_chat_answer(session_key, question)
+
+        save_gpt_result(
+            request_id=request_id,
+            session_key=session_key,
+            status="done",
+            question=question,
+            answer=answer,
+        )
+
+        logger.info(
+            "[GPT_ASYNC] done request_id=%s answer_len=%d",
+            request_id,
+            len(answer),
+        )
+
+    except Exception as e:
+        logger.exception("[GPT_ASYNC] failed request_id=%s error=%s", request_id, e)
+
+        save_gpt_result(
+            request_id=request_id,
+            session_key=session_key,
+            status="error",
+            question=question,
+            error=str(e),
+        )
+
+
+def build_result_response(result: Optional[Dict[str, Any]]) -> JSONResponse:
+    if not result:
+        return respond(
+            make_message(
+                text="조회 가능한 GPT 응답이 없습니다.",
+                response_type="ephemeral",
+            ),
+            tag="gpt-result-empty",
+        )
+
+    status = result.get("status")
+    request_id = result.get("requestId")
+    question = result.get("question") or ""
+
+    if status == "processing":
+        return respond(
+            make_message(
+                text=(
+                    "아직 GPT 응답을 생성 중입니다.\n"
+                    f"요청 ID: `{request_id}`\n"
+                    f"질문: {question}"
+                ),
+                response_type="ephemeral",
+            ),
+            tag="gpt-result-processing",
+        )
+
+    if status == "error":
+        return respond(
+            make_message(
+                text=(
+                    "⚠️ GPT 질의 중 오류가 발생했습니다.\n"
+                    f"요청 ID: `{request_id}`\n"
+                    f"오류: {result.get('error') or 'unknown error'}"
+                ),
+                response_type="ephemeral",
+            ),
+            tag="gpt-result-error",
+        )
+
+    answer = result.get("answer") or ""
+
+    return respond(
+        make_message(
+            text=answer,
+            response_type="inChannel",
+            replace_original=False,
+        ),
+        tag="gpt-result-done",
+    )
+
+
 # ---------- Endpoints ----------
 @app.get("/")
 async def root():
@@ -416,14 +586,18 @@ async def health():
 
 
 @app.post("/dooray/gpt")
-async def dooray_gpt(req: Request):
+async def dooray_gpt(req: Request, background_tasks: BackgroundTasks):
     """
-    Dooray 대화형 GPT 엔드포인트.
+    Dooray GPT 질문 접수 엔드포인트.
 
-    - 질문을 받으면 바로 GPT 답변 반환
+    동작:
+    - 질문을 받으면 requestId 생성
+    - GPT 응답 생성을 백그라운드로 실행
+    - 이 엔드포인트에서는 GPT 답변을 바로 반환하지 않음
+    - /dooray/gpt/result 에서 나중에 조회
     - 세션별 이전 대화 기록 유지
     - 오래된 대화는 요약해서 토큰 절약
-    - 답변은 500자 이하로 유도 및 최종 절단
+    - 답변은 기본 2500자 이하로 유도 및 최종 절단
     """
     verify_request(req)
 
@@ -449,6 +623,7 @@ async def dooray_gpt(req: Request):
 
     if question.strip() in ["/reset", "reset", "초기화", "대화초기화"]:
         reset_chat(session_key)
+
         return respond(
             make_message(
                 text="대화 기억을 초기화했습니다.",
@@ -457,28 +632,81 @@ async def dooray_gpt(req: Request):
             tag="gpt-reset",
         )
 
-    try:
-        answer = generate_chat_answer(session_key, question)
+    request_id = str(uuid.uuid4())
 
-        return respond(
-            make_message(
-                text=answer,
-                response_type="inChannel",
-                replace_original=False,
+    save_gpt_result(
+        request_id=request_id,
+        session_key=session_key,
+        status="processing",
+        question=question,
+    )
+
+    background_tasks.add_task(
+        generate_and_store_gpt_answer,
+        request_id,
+        session_key,
+        question,
+    )
+
+    return respond(
+        make_message(
+            text=(
+                "질의를 접수했습니다.\n"
+                f"요청 ID: `{request_id}`\n\n"
+                "잠시 후 결과 조회 엔드포인트에서 응답을 가져오면 됩니다."
             ),
-            tag="gpt-chat",
-        )
+            response_type="ephemeral",
+            replace_original=False,
+        ),
+        tag="gpt-accepted",
+    )
 
-    except Exception as e:
-        logger.exception("[GPT_CHAT] failed: %s", e)
 
-        return respond(
-            make_message(
-                text="⚠️ GPT 응답 생성 중 오류가 발생했습니다. 로그를 확인해 주세요.",
-                response_type="ephemeral",
-            ),
-            tag="gpt-chat-error",
-        )
+@app.post("/dooray/gpt/result")
+async def dooray_gpt_result_post(req: Request):
+    """
+    GPT 결과 조회 엔드포인트 - POST 방식.
+
+    requestId/request_id/id 중 하나로 요청 ID를 받을 수 있음.
+    요청 ID가 없으면 현재 세션의 최신 GPT 결과를 반환.
+    세션 정보도 없으면 전체 최신 GPT 결과를 반환.
+    """
+    verify_request(req)
+
+    raw = (await req.body()).decode("utf-8", "ignore")
+    logger.info(
+        "[IN] POST /dooray/gpt/result CT=%s RAW=%s",
+        req.headers.get("content-type"),
+        raw[:2000],
+    )
+
+    data, _ = await parse_dooray_payload(req)
+
+    request_id = extract_request_id(data, req)
+    session_key = extract_session_key(data, req)
+
+    result = get_gpt_result(request_id=request_id, session_key=session_key)
+
+    return build_result_response(result)
+
+
+@app.get("/dooray/gpt/result")
+async def dooray_gpt_result_get(req: Request):
+    """
+    GPT 결과 조회 엔드포인트 - GET 방식.
+
+    예:
+    /dooray/gpt/result?id=요청ID
+    /dooray/gpt/result?requestId=요청ID
+
+    요청 ID가 없으면 전체 최신 GPT 결과를 반환.
+    """
+    verify_request(req)
+
+    request_id = extract_request_id({}, req)
+    result = get_gpt_result(request_id=request_id)
+
+    return build_result_response(result)
 
 
 @app.post("/dooray/gpt/reset")
@@ -513,8 +741,12 @@ async def dooray_gpt_debug(req: Request):
     with STORE_LOCK:
         return {
             "sessionCount": len(CHAT_STORE),
+            "resultCount": len(GPT_RESULTS),
+            "latestRequestId": LATEST_REQUEST_ID,
             "maxHistoryMessages": MAX_HISTORY_MESSAGES,
             "maxSummaryChars": MAX_SUMMARY_CHARS,
+            "maxAnswerChars": MAX_ANSWER_CHARS,
+            "maxCompletionTokens": MAX_COMPLETION_TOKENS,
             "model": OPENAI_MODEL,
         }
 
