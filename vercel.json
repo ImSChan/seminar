@@ -1,7 +1,9 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "routes": [
-    { "src": "^/dooray/gpt/result$", "dest": "api/index.py" },
-    { "src": "^/dooray/gpt$", "dest": "api/index.py" }
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.py"
+    }
   ]
 }
