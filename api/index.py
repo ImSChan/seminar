@@ -343,7 +343,7 @@ def summarize_if_needed(chat: Dict[str, Any]):
                 },
             ],
             temperature=0.2,
-            max_tokens=500,
+            max_completion_tokens=500,
         )
 
         summary = res.choices[0].message.content or ""
